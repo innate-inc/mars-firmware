@@ -330,17 +330,17 @@ void sendLEDCommand() {
 
   // Protocol payload
   message[2] = 0x02;  // LED command ID
-  message[3] = 0x03;  // LED Mode: 3 (Ring mode)
+  message[3] = 0x02;  // LED Mode: 3 (Ring mode)
 
   // Time parameter: 100 ms (16-bit unsigned, high byte then low)
-  uint16_t timeParam = 100;
+  uint16_t timeParam = 500;
   message[4] = (uint8_t)((timeParam >> 8) & 0xFF);
   message[5] = (uint8_t)(timeParam & 0xFF);
 
   // LED color: Red = 0xFF, Green = 0x00, Blue = 0x00
-  message[6] = 0xFF;
-  message[7] = 0x00;
-  message[8] = 0x00;
+  message[6] = 0x00;
+  message[7] = 0xFF;
+  message[8] = 0xFF;
 
   // CRC computed over payload bytes (bytes 2-8)
   message[9] = calculateCRC8Maxim(&message[2], 7);
