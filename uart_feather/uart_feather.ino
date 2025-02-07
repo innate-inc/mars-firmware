@@ -1,28 +1,6 @@
-/*
-  Joystick to Serial1 Command Publisher with Updated Protocol (10-byte messages)
-  ------------------------------------------------------------------------------
-  Protocol Summary:
-    - Total Message Length: 10 bytes
-      • Bytes 0-1: SOM marker (0x69, 0x69)
-      • Bytes 2-8: Protocol message (7 bytes payload)
-      • Byte 9: CRC‑8/MAXIM over bytes 2–8
-  Movement Command (0x01):
-    • Bytes 3-4: Forward Speed (16-bit signed fixed-point, scale×100; big-endian)
-    • Bytes 5-6: Turn Rate (16-bit signed fixed-point, scale×100; big-endian)
-    • Bytes 7-8: Reserved (0x00)
-  LED Command (0x02):
-    • Byte 3: LED Mode (3 for Ring mode)
-    • Bytes 4-5: Time Parameter (16-bit unsigned, 100 ms; high byte then low byte)
-    • Byte 6: Red intensity (0xFF)
-    • Byte 7: Green intensity (0x00)
-    • Byte 8: Blue intensity (0x00)
-  
-  The messages are sent over Serial1 (hardware UART on RX/TX), and debug info is printed to Serial.
-*/
-
 #include <Arduino.h>
 
-// ADC configuration (assuming a 10-bit ADC: 0-1023)
+// ADC configuration (assuming a 10-bit ADC: 0–1023)
 const int ADC_MAX = 1023;
 const float VREF = 3.3;  // Reference voltage in volts
 
@@ -38,11 +16,146 @@ const float maxTurn  = 2.56;   // Turn rate range ±2.56
 // Pin definition for the button (used for triggering the LED command)
 const int buttonPin = A4;
 
-// Function Prototypes
+// -----------------------------------------------------------------------------
+// Forward Declarations
 float mapJoystick(float voltage, float center, float deadband, float effective, float maxCommand);
 uint8_t calculateCRC8Maxim(uint8_t *data, int len);
 void sendMovementCommand(float speed, float turn);
 void sendLEDCommand();
+
+// --- Functions for Receiving and Processing Incoming Messages ---
+
+// Define a simple state machine to parse incoming messages
+enum ParseState { WAIT_FOR_SOM1, WAIT_FOR_SOM2, READ_PAYLOAD };
+ParseState parseState = WAIT_FOR_SOM1;
+uint8_t rxBuffer[10];
+uint8_t rxIndex = 0;
+
+/*
+ * processSerialMessages()
+ *
+ * This function reads incoming bytes from Serial1, looks for the two-byte SOM
+ * marker (0x69, 0x69), collects the subsequent 8 bytes (payload and CRC), then
+ * validates the message by computing the CRC‑8/MAXIM on bytes 2–8.
+ *
+ * If the message is valid, print its contents according to the response type.
+ */
+void processSerialMessages() {
+  while (Serial1.available() > 0) {
+    uint8_t b = Serial1.read();
+    switch (parseState) {
+      case WAIT_FOR_SOM1:
+        if (b == 0x69) {
+          parseState = WAIT_FOR_SOM2;
+        }
+        break;
+
+      case WAIT_FOR_SOM2:
+        if (b == 0x69) {
+          // Found complete SOM marker. Save it and start reading the payload.
+          rxBuffer[0] = 0x69;
+          rxBuffer[1] = 0x69;
+          rxIndex = 2; // Next byte will be payload byte 0 (command/response ID)
+          parseState = READ_PAYLOAD;
+        } else {
+          // Incorrect sequence: start over.
+          parseState = WAIT_FOR_SOM1;
+        }
+        break;
+
+      case READ_PAYLOAD:
+        rxBuffer[rxIndex++] = b;
+        if (rxIndex >= 10) { // We have all 10 bytes
+          // Validate the message (compute CRC over bytes 2–8 and compare with byte 9)
+          if (validateMessage(rxBuffer)) {
+            printMessage(rxBuffer);
+          } else {
+            Serial.println("Invalid message received (CRC mismatch).");
+          }
+          // Reset the state machine to search for the next message.
+          parseState = WAIT_FOR_SOM1;
+          rxIndex = 0;
+        }
+        break;
+    }
+  }
+}
+
+/*
+ * validateMessage()
+ *
+ * Computes the CRC‑8/MAXIM over bytes 2–8 of the 10-byte message and compares
+ * it to the received CRC (byte 9). Returns true if they match.
+ */
+bool validateMessage(uint8_t *msg) {
+  uint8_t computedCRC = calculateCRC8Maxim(&msg[2], 7);
+  return (computedCRC == msg[9]);
+}
+
+/*
+ * printMessage()
+ *
+ * Decodes and prints the contents of a valid response message.
+ * Supported response IDs are:
+ *   • 0x81: Movement (Position Update) Response
+ *   • 0x82: LED Response
+ *   • 0x83: Status Response
+ */
+void printMessage(uint8_t *msg) {
+  uint8_t responseID = msg[2];
+  switch (responseID) {
+    case 0x81: {  // Movement (Position Update) Response
+      int16_t x = (msg[3] << 8) | msg[4];
+      int16_t y = (msg[5] << 8) | msg[6];
+      int16_t theta = (msg[7] << 8) | msg[8];
+      Serial.print("Movement Response Received: X=");
+      Serial.print(x);
+      Serial.print(" Y=");
+      Serial.print(y);
+      Serial.print(" Theta=");
+      Serial.println(theta);
+      break;
+    }
+    case 0x82: {  // LED Response
+      uint8_t ledMode = msg[3];
+      uint8_t red = msg[4];
+      uint8_t green = msg[5];
+      uint8_t blue = msg[6];
+      uint16_t timeParam = (msg[7] << 8) | msg[8];
+      Serial.print("LED Response Received: Mode=");
+      Serial.print(ledMode);
+      Serial.print(" Red=");
+      Serial.print(red);
+      Serial.print(" Green=");
+      Serial.print(green);
+      Serial.print(" Blue=");
+      Serial.print(blue);
+      Serial.print(" Time Parameter=");
+      Serial.println(timeParam);
+      break;
+    }
+    case 0x83: {  // Status Response
+      uint16_t batteryVoltage = (msg[3] << 8) | msg[4];
+      uint16_t motorTemp = (msg[5] << 8) | msg[6];
+      uint8_t faultCode = msg[7];
+      Serial.print("Status Response Received: Battery Voltage=");
+      Serial.print(batteryVoltage);
+      Serial.print(" Motor Temp=");
+      Serial.print(motorTemp);
+      Serial.print(" Fault Code=");
+      Serial.println(faultCode);
+      break;
+    }
+    default:
+      Serial.print("Unknown Response ID: ");
+      Serial.println(responseID, HEX);
+      break;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Setup & Loop
+// -----------------------------------------------------------------------------
 
 void setup() {
   // Initialize USB serial for debugging
@@ -59,7 +172,10 @@ void setup() {
 }
 
 void loop() {
-  // --- 1. Read Joystick Values and Send Movement Command ---
+  // --- 1. Process any incoming messages ---
+  processSerialMessages();
+
+  // --- 2. Read Joystick Values and Send Movement Command ---
   int rawA2 = analogRead(A2);  // Speed axis
   int rawA3 = analogRead(A3);  // Turn axis
 
@@ -71,7 +187,7 @@ void loop() {
 
   sendMovementCommand(speedCommand, turnCommand);
 
-  // --- 2. Check Button State and Send LED Command on Press ---
+  // --- 3. Check Button State and Send LED Command on Press ---
   static int lastButtonState = HIGH;
   int currentButtonState = digitalRead(buttonPin);
   if (currentButtonState != lastButtonState) {
@@ -82,18 +198,22 @@ void loop() {
     lastButtonState = currentButtonState;
   }
 
-  // --- 3. Debug Output ---
-  Serial.print("A2 Voltage: ");
+  // --- 4. Debug Output ---
+  /*Serial.print("A2 Voltage: ");
   Serial.print(voltageA2, 3);
   Serial.print(" V => Speed: ");
   Serial.print(speedCommand, 3);
   Serial.print("\tA3 Voltage: ");
   Serial.print(voltageA3, 3);
   Serial.print(" V => Turn: ");
-  Serial.println(turnCommand, 3);
+  Serial.println(turnCommand, 3);*/
 
-  delay(5);  // Loop every 500 ms
+  delay(5);  // Short delay; adjust as needed
 }
+
+// -----------------------------------------------------------------------------
+// Utility Functions (Sending & CRC Calculation)
+// -----------------------------------------------------------------------------
 
 /*
  * mapJoystick()
@@ -126,11 +246,10 @@ uint8_t calculateCRC8Maxim(uint8_t *data, int len) {
   for (int j = 0; j < len; j++) {
     crc ^= data[j];
     for (int i = 0; i < 8; i++) {
-      if (crc & 0x01) {
+      if (crc & 0x01)
         crc = (crc >> 1) ^ 0x8C;
-      } else {
+      else
         crc >>= 1;
-      }
     }
   }
   return crc;
@@ -179,13 +298,13 @@ void sendMovementCommand(float speed, float turn) {
   Serial1.write(message, 10);
 
   // Debug: Print the message in hexadecimal format
-  Serial.print("Sent Movement Message: ");
+  /*Serial.print("Sent Movement Message: ");
   for (int i = 0; i < 10; i++) {
     if (message[i] < 0x10) Serial.print("0");
     Serial.print(message[i], HEX);
     Serial.print(" ");
   }
-  Serial.println();
+  Serial.println();*/
 }
 
 /*
@@ -238,3 +357,4 @@ void sendLEDCommand() {
   }
   Serial.println();
 }
+
