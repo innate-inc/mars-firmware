@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <math.h>  // For PI and math operations
 
 // ADC configuration (assuming a 10-bit ADC: 0–1023)
 const int ADC_MAX = 1023;
@@ -16,30 +17,34 @@ const float maxTurn  = 2.56;   // Turn rate range ±2.56
 // Pin definition for the button (used for triggering the LED command)
 const int buttonPin = A4;
 
-// -----------------------------------------------------------------------------
-// Forward Declarations
+// Global state for current position feedback.
+// X and Y are in millimeters.
+// Theta is stored in degrees (normalized between -180 and 180).
+struct Position {
+  int16_t x;
+  int16_t y;
+  float theta;
+};
+
+Position currentPosition = {0, 0, 0.0};
+unsigned long lastPositionPrintTime = 0; // For printing every 5 seconds
+
+// --- Function Declarations ---
 float mapJoystick(float voltage, float center, float deadband, float effective, float maxCommand);
 uint8_t calculateCRC8Maxim(uint8_t *data, int len);
 void sendMovementCommand(float speed, float turn);
 void sendLEDCommand();
+bool validateMessage(uint8_t *msg);
+void printMessage(uint8_t *msg);
+void processSerialMessages();
 
 // --- Functions for Receiving and Processing Incoming Messages ---
 
-// Define a simple state machine to parse incoming messages
 enum ParseState { WAIT_FOR_SOM1, WAIT_FOR_SOM2, READ_PAYLOAD };
 ParseState parseState = WAIT_FOR_SOM1;
 uint8_t rxBuffer[10];
 uint8_t rxIndex = 0;
 
-/*
- * processSerialMessages()
- *
- * This function reads incoming bytes from Serial1, looks for the two-byte SOM
- * marker (0x69, 0x69), collects the subsequent 8 bytes (payload and CRC), then
- * validates the message by computing the CRC‑8/MAXIM on bytes 2–8.
- *
- * If the message is valid, print its contents according to the response type.
- */
 void processSerialMessages() {
   while (Serial1.available() > 0) {
     uint8_t b = Serial1.read();
@@ -49,30 +54,27 @@ void processSerialMessages() {
           parseState = WAIT_FOR_SOM2;
         }
         break;
-
       case WAIT_FOR_SOM2:
         if (b == 0x69) {
-          // Found complete SOM marker. Save it and start reading the payload.
+          // Found complete SOM marker.
           rxBuffer[0] = 0x69;
           rxBuffer[1] = 0x69;
-          rxIndex = 2; // Next byte will be payload byte 0 (command/response ID)
+          rxIndex = 2;  // Next byte will be payload (command/response ID)
           parseState = READ_PAYLOAD;
         } else {
-          // Incorrect sequence: start over.
           parseState = WAIT_FOR_SOM1;
         }
         break;
-
       case READ_PAYLOAD:
         rxBuffer[rxIndex++] = b;
-        if (rxIndex >= 10) { // We have all 10 bytes
-          // Validate the message (compute CRC over bytes 2–8 and compare with byte 9)
+        if (rxIndex >= 10) { // We have all 10 bytes.
+          // Validate the message (CRC computed over bytes 2–8).
           if (validateMessage(rxBuffer)) {
             printMessage(rxBuffer);
           } else {
             Serial.println("Invalid message received (CRC mismatch).");
           }
-          // Reset the state machine to search for the next message.
+          // Reset state machine for next message.
           parseState = WAIT_FOR_SOM1;
           rxIndex = 0;
         }
@@ -81,39 +83,44 @@ void processSerialMessages() {
   }
 }
 
-/*
- * validateMessage()
- *
- * Computes the CRC‑8/MAXIM over bytes 2–8 of the 10-byte message and compares
- * it to the received CRC (byte 9). Returns true if they match.
- */
 bool validateMessage(uint8_t *msg) {
   uint8_t computedCRC = calculateCRC8Maxim(&msg[2], 7);
   return (computedCRC == msg[9]);
 }
 
-/*
- * printMessage()
- *
- * Decodes and prints the contents of a valid response message.
- * Supported response IDs are:
- *   • 0x81: Movement (Position Update) Response
- *   • 0x82: LED Response
- *   • 0x83: Status Response
- */
 void printMessage(uint8_t *msg) {
   uint8_t responseID = msg[2];
   switch (responseID) {
     case 0x81: {  // Movement (Position Update) Response
+      // Extract raw data.
       int16_t x = (msg[3] << 8) | msg[4];
       int16_t y = (msg[5] << 8) | msg[6];
-      int16_t theta = (msg[7] << 8) | msg[8];
+      int16_t theta_raw = (msg[7] << 8) | msg[8];
+      
+      // Convert theta:
+      // - The raw theta is in hundredths of a radian.
+      // - Divide by 100 to get radians.
+      // - Multiply by (180/PI) to convert to degrees.
+      float theta_rad = theta_raw / 100.0;
+      float theta_deg = theta_rad * (180.0 / PI);
+      
+      // Normalize theta to be between -180 and 180 degrees.
+      while (theta_deg > 180) theta_deg -= 360;
+      while (theta_deg < -180) theta_deg += 360;
+      
+      // Update global state.
+      currentPosition.x = x;
+      currentPosition.y = y;
+      currentPosition.theta = theta_deg;
+      
+      // Print the converted values.
       Serial.print("Movement Response Received: X=");
       Serial.print(x);
-      Serial.print(" Y=");
+      Serial.print(" mm, Y=");
       Serial.print(y);
-      Serial.print(" Theta=");
-      Serial.println(theta);
+      Serial.print(" mm, Theta=");
+      Serial.print(theta_deg, 2);
+      Serial.println(" deg");
       break;
     }
     case 0x82: {  // LED Response
@@ -153,31 +160,33 @@ void printMessage(uint8_t *msg) {
   }
 }
 
-// -----------------------------------------------------------------------------
-// Setup & Loop
-// -----------------------------------------------------------------------------
-
+// --- Setup & Loop ---
 void setup() {
-  // Initialize USB serial for debugging
+  // Initialize USB serial for debugging.
   Serial.begin(115200);
-  while (!Serial) { ; } // Wait for USB serial connection
-
-  // Initialize hardware UART (Serial1) on RX/TX pins
+  while (!Serial) { ; }
+  
+  // Initialize hardware UART (Serial1).
   Serial1.begin(115200);
 
-  // Configure the button pin with an internal pull-up resistor
+  // Configure the button pin with an internal pull-up resistor.
   pinMode(buttonPin, INPUT_PULLUP);
 
-  Serial.println("Starting Joystick and LED Command Publisher with Updated Protocol...");
+  // Seed the random number generator using an unconnected analog pin.
+  randomSeed(analogRead(A0));
+
+  Serial.println("Starting Joystick and LED Command Publisher...");
 }
 
 void loop() {
-  // --- 1. Process any incoming messages ---
+  unsigned long currentMillis = millis();
+
+  // 1. Process any incoming messages.
   processSerialMessages();
 
-  // --- 2. Read Joystick Values and Send Movement Command ---
-  int rawA2 = analogRead(A2);  // Speed axis
-  int rawA3 = analogRead(A3);  // Turn axis
+  // 2. Read Joystick Values and Send Movement Command.
+  int rawA2 = analogRead(A2);  // Speed axis.
+  int rawA3 = analogRead(A3);  // Turn axis.
 
   float voltageA2 = (rawA2 * VREF) / ADC_MAX;
   float voltageA3 = (rawA3 * VREF) / ADC_MAX;
@@ -187,40 +196,39 @@ void loop() {
 
   sendMovementCommand(speedCommand, turnCommand);
 
-  // --- 3. Check Button State and Send LED Command on Press ---
+  // 3. Check Button State and Send LED Command on Press.
   static int lastButtonState = HIGH;
   int currentButtonState = digitalRead(buttonPin);
   if (currentButtonState != lastButtonState) {
     if (currentButtonState == LOW) {
-      // Button pressed: send LED command (Ring mode, 100 ms, red)
+      // Button pressed: send an LED command with random mode, time, and color.
       sendLEDCommand();
     }
     lastButtonState = currentButtonState;
   }
 
-  // --- 4. Debug Output ---
-  /*Serial.print("A2 Voltage: ");
-  Serial.print(voltageA2, 3);
-  Serial.print(" V => Speed: ");
-  Serial.print(speedCommand, 3);
-  Serial.print("\tA3 Voltage: ");
-  Serial.print(voltageA3, 3);
-  Serial.print(" V => Turn: ");
-  Serial.println(turnCommand, 3);*/
+  // 4. Every 5 seconds, print the current position from state.
+  if (currentMillis - lastPositionPrintTime >= 1000) {
+    Serial.print("Current Position - X: ");
+    Serial.print(currentPosition.x);
+    Serial.print(" mm, Y: ");
+    Serial.print(currentPosition.y);
+    Serial.print(" mm, Theta: ");
+    Serial.print(currentPosition.theta, 2);
+    Serial.println(" deg");
+    lastPositionPrintTime = currentMillis;
+  }
 
-  delay(5);  // Short delay; adjust as needed
+  delay(20);  // Maintain a 50 Hz loop (20 ms per iteration).
 }
 
-// -----------------------------------------------------------------------------
-// Utility Functions (Sending & CRC Calculation)
-// -----------------------------------------------------------------------------
+// --- Utility Functions ---
 
 /*
  * mapJoystick()
  *
  * Converts a joystick voltage reading to a command value.
- * If within the deadband (±deadband around center), returns 0.
- * Otherwise, scales the deviation (beyond deadband) linearly to ±maxCommand.
+ * Returns 0 if the reading is within the deadband.
  */
 float mapJoystick(float voltage, float center, float deadband, float effective, float maxCommand) {
   float delta = voltage - center;
@@ -237,9 +245,7 @@ float mapJoystick(float voltage, float center, float deadband, float effective, 
 /*
  * calculateCRC8Maxim()
  *
- * Computes the CRC‑8/MAXIM over a block of data.
- * Uses a reflected polynomial (0x8C) with an initial value of 0x00.
- * The CRC is computed over the provided data array (of length 'len').
+ * Computes the CRC‑8/MAXIM checksum over the provided data.
  */
 uint8_t calculateCRC8Maxim(uint8_t *data, int len) {
   uint8_t crc = 0x00;
@@ -270,85 +276,77 @@ uint8_t calculateCRC8Maxim(uint8_t *data, int len) {
 void sendMovementCommand(float speed, float turn) {
   uint8_t message[10];
 
-  // Set SOM marker
+  // Set SOM marker.
   message[0] = 0x69;
   message[1] = 0x69;
+  
+  // Command ID for movement.
+  message[2] = 0x01;
 
-  // Protocol payload
-  message[2] = 0x01;  // Movement command ID
-
-  // Forward speed conversion (16-bit signed, scale by 100)
+  // Convert forward speed (scale by 100).
   int16_t speedVal = (int16_t)(speed * 100);
   message[3] = (uint8_t)((speedVal >> 8) & 0xFF);
   message[4] = (uint8_t)(speedVal & 0xFF);
 
-  // Turn rate conversion (16-bit signed, scale by 100)
+  // Convert turn rate (scale by 100).
   int16_t turnVal = (int16_t)(turn * 100);
   message[5] = (uint8_t)((turnVal >> 8) & 0xFF);
   message[6] = (uint8_t)(turnVal & 0xFF);
 
-  // Reserved bytes
+  // Reserved bytes.
   message[7] = 0x00;
   message[8] = 0x00;
 
-  // CRC computed over payload bytes (bytes 2-8)
+  // CRC calculated over payload bytes (2–8).
   message[9] = calculateCRC8Maxim(&message[2], 7);
 
-  // Send the message over Serial1 (UART)
+  // Send the message.
   Serial1.write(message, 10);
-
-  // Debug: Print the message in hexadecimal format
-  /*Serial.print("Sent Movement Message: ");
-  for (int i = 0; i < 10; i++) {
-    if (message[i] < 0x10) Serial.print("0");
-    Serial.print(message[i], HEX);
-    Serial.print(" ");
-  }
-  Serial.println();*/
 }
 
 /*
  * sendLEDCommand()
  *
  * Constructs and sends a 10-byte LED command message over Serial1.
- * Message structure:
- *   Bytes 0-1: SOM marker (0x69, 0x69)
- *   Byte 2:    Command ID (0x02)
- *   Byte 3:    LED Mode (3 for Ring mode)
- *   Bytes 4-5: Time Parameter (16-bit unsigned; 100 ms → high byte then low byte)
- *   Byte 6:    Red intensity (0xFF)
- *   Byte 7:    Green intensity (0x00)
- *   Byte 8:    Blue intensity (0x00)
- *   Byte 9:    CRC‑8/MAXIM computed over bytes 2–8.
+ * The LED command now uses randomized parameters:
+ *   - LED Mode: Random value (0–255)
+ *   - Time Parameter: Random value between 300 and 3000 ms.
+ *   - LED Color: Each of R, G, B is random (0–255)
  */
 void sendLEDCommand() {
   uint8_t message[10];
 
-  // Set SOM marker
+  // Set SOM marker.
   message[0] = 0x69;
   message[1] = 0x69;
+  
+  // Command ID for LED.
+  message[2] = 0x02;
 
-  // Protocol payload
-  message[2] = 0x02;  // LED command ID
-  message[3] = 0x02;  // LED Mode: 3 (Ring mode)
+  // Randomize LED mode (0–255).
+  uint8_t ledMode = random(0, 4);
+  message[3] = ledMode;
 
-  // Time parameter: 100 ms (16-bit unsigned, high byte then low)
-  uint16_t timeParam = 500;
+  // Randomize time parameter between 300 and 3000 ms.
+  uint16_t timeParam = random(100, 600);  // random(min, max) where max is exclusive.
   message[4] = (uint8_t)((timeParam >> 8) & 0xFF);
   message[5] = (uint8_t)(timeParam & 0xFF);
 
-  // LED color: Red = 0xFF, Green = 0x00, Blue = 0x00
-  message[6] = 0x00;
-  message[7] = 0xFF;
-  message[8] = 0xFF;
+  // Randomize LED color values (Red, Green, Blue; each 0–255).
+  uint8_t red   = random(0, 256);
+  uint8_t green = random(0, 256);
+  uint8_t blue  = random(0, 256);
+  message[6] = red;
+  message[7] = green;
+  message[8] = blue;
 
-  // CRC computed over payload bytes (bytes 2-8)
+  // Compute CRC over payload bytes (2–8).
   message[9] = calculateCRC8Maxim(&message[2], 7);
 
-  // Send the message over Serial1 (UART)
+  // Send the LED command.
   Serial1.write(message, 10);
 
-  // Debug: Print the LED command message in hexadecimal format
+  // Debug output.
   Serial.print("Sent LED Command: ");
   for (int i = 0; i < 10; i++) {
     if (message[i] < 0x10) Serial.print("0");
@@ -356,5 +354,17 @@ void sendLEDCommand() {
     Serial.print(" ");
   }
   Serial.println();
+
+  Serial.print("Mode: ");
+  Serial.print(ledMode);
+  Serial.print(" Time: ");
+  Serial.print(timeParam);
+  Serial.print(" ms  Color: (");
+  Serial.print(red);
+  Serial.print(", ");
+  Serial.print(green);
+  Serial.print(", ");
+  Serial.print(blue);
+  Serial.println(")");
 }
 
