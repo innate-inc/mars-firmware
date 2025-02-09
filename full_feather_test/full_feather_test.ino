@@ -14,7 +14,7 @@ const uint8_t SOM[2] = {0x69, 0x69};   // Start-of-Message marker
 
 // LED definitions
 #define LED_PIN     2       // Pin for NeoPixel strip
-#define NUM_LEDS    7       // Number of LEDs
+#define NUM_LEDS    39       // Number of LEDs
 
 // Motor feedback buffer size
 #define MOTOR_BUFFER_SIZE 64
@@ -537,18 +537,21 @@ void setup() {
   
   // Initialize Serial1 for host communications
   Serial1.begin(115200);
+  delay(200);
   
   // Initialize motor UARTs
   SerialLeft.begin(115200);
+  delay(200);
   pinPeripheral(PIN_A2, PIO_SERCOM_ALT);  // Set A2 as TX for SERCOM4
   pinPeripheral(PIN_A3, PIO_SERCOM_ALT);  // Set A3 as RX for SERCOM4
   
   SerialRight.begin(115200);
+  delay(200);
   pinPeripheral(PIN_A4, PIO_SERCOM_ALT);  // Set A4 as TX for SERCOM0
   pinPeripheral(PIN_A1, PIO_SERCOM_ALT);  // Set A1 as RX for SERCOM0
   
   Serial.println("Serial1, SerialLeft, and SerialRight initialized.");
-  
+  delay(200);
   // Initialize the LED strip
   strip.begin();
   strip.clear();
