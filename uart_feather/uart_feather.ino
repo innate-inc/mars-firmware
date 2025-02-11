@@ -27,7 +27,7 @@ struct Position {
 };
 
 Position currentPosition = {0, 0, 0.0};
-unsigned long lastPositionPrintTime = 0; // For printing every 5 seconds
+unsigned long lastPositionPrintTime = 0; // For printing every 1 second
 
 // --- Function Declarations ---
 float mapJoystick(float voltage, float center, float deadband, float effective, float maxCommand);
@@ -48,6 +48,9 @@ uint8_t rxIndex = 0;
 void processSerialMessages() {
   while (Serial1.available() > 0) {
     uint8_t b = Serial1.read();
+    // (No per-byte printing here.)
+
+    // State machine for packet assembly.
     switch (parseState) {
       case WAIT_FOR_SOM1:
         if (b == 0x69) {
@@ -89,6 +92,16 @@ bool validateMessage(uint8_t *msg) {
 }
 
 void printMessage(uint8_t *msg) {
+  // First, print the entire 10-byte message as a hex dump.
+  Serial.print("Valid message received: ");
+  for (int i = 0; i < 10; i++) {
+    if (msg[i] < 0x10) Serial.print("0");
+    Serial.print(msg[i], HEX);
+    Serial.print(" ");
+  }
+  Serial.println();
+
+  // Then interpret the message based on the response ID.
   uint8_t responseID = msg[2];
   switch (responseID) {
     case 0x81: {  // Movement (Position Update) Response
@@ -113,7 +126,7 @@ void printMessage(uint8_t *msg) {
       currentPosition.y = y;
       currentPosition.theta = theta_deg;
       
-      // Print the converted values.
+      // Print the interpreted values.
       Serial.print("Movement Response Received: X=");
       Serial.print(x);
       Serial.print(" mm, Y=");
@@ -181,7 +194,7 @@ void setup() {
 void loop() {
   unsigned long currentMillis = millis();
 
-  // 1. Process any incoming messages.
+  // 1. Process any incoming messages from Serial1.
   processSerialMessages();
 
   // 2. Read Joystick Values and Send Movement Command.
@@ -201,13 +214,13 @@ void loop() {
   int currentButtonState = digitalRead(buttonPin);
   if (currentButtonState != lastButtonState) {
     if (currentButtonState == LOW) {
-      // Button pressed: send an LED command with random mode, time, and color.
+      // Button pressed: send an LED command with random parameters.
       sendLEDCommand();
     }
     lastButtonState = currentButtonState;
   }
 
-  // 4. Every 5 seconds, print the current position from state.
+  // 4. Every 1 second, print the current position from state.
   if (currentMillis - lastPositionPrintTime >= 1000) {
     Serial.print("Current Position - X: ");
     Serial.print(currentPosition.x);
@@ -309,8 +322,8 @@ void sendMovementCommand(float speed, float turn) {
  *
  * Constructs and sends a 10-byte LED command message over Serial1.
  * The LED command now uses randomized parameters:
- *   - LED Mode: Random value (0–255)
- *   - Time Parameter: Random value between 300 and 3000 ms.
+ *   - LED Mode: Random value (0–3)
+ *   - Time Parameter: Random value between 100 and 600 ms.
  *   - LED Color: Each of R, G, B is random (0–255)
  */
 void sendLEDCommand() {
@@ -323,12 +336,12 @@ void sendLEDCommand() {
   // Command ID for LED.
   message[2] = 0x02;
 
-  // Randomize LED mode (0–255).
+  // Randomize LED mode (0–3).
   uint8_t ledMode = random(0, 4);
   message[3] = ledMode;
 
-  // Randomize time parameter between 300 and 3000 ms.
-  uint16_t timeParam = random(100, 600);  // random(min, max) where max is exclusive.
+  // Randomize time parameter between 100 and 600 ms.
+  uint16_t timeParam = random(100, 600);
   message[4] = (uint8_t)((timeParam >> 8) & 0xFF);
   message[5] = (uint8_t)(timeParam & 0xFF);
 
@@ -346,7 +359,7 @@ void sendLEDCommand() {
   // Send the LED command.
   Serial1.write(message, 10);
 
-  // Debug output.
+  // Optionally, print the LED command that was sent.
   Serial.print("Sent LED Command: ");
   for (int i = 0; i < 10; i++) {
     if (message[i] < 0x10) Serial.print("0");
@@ -354,7 +367,6 @@ void sendLEDCommand() {
     Serial.print(" ");
   }
   Serial.println();
-
   Serial.print("Mode: ");
   Serial.print(ledMode);
   Serial.print(" Time: ");
@@ -367,4 +379,5 @@ void sendLEDCommand() {
   Serial.print(blue);
   Serial.println(")");
 }
+
 

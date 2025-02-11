@@ -532,7 +532,7 @@ void sendStatusResponse() {
 // ---------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);     // For debugging
-  while (!Serial);          // Wait for Serial monitor
+  //while (!Serial);          // Wait for Serial monitor
   Serial.println("Initializing Robot Controller...");
   
   // Initialize Serial1 for host communications
