@@ -48,6 +48,7 @@ uint8_t rxIndex = 0;
 void processSerialMessages() {
   while (Serial1.available() > 0) {
     uint8_t b = Serial1.read();
+    //Serial.print(b);
     // (No per-byte printing here.)
 
     // State machine for packet assembly.
