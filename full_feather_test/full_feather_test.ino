@@ -258,33 +258,33 @@ void processMotorFeedback() {
 // Compute Motor Commands from the Latest Velocity Command
 // ---------------------------------------------------------------------
 void computeMotorCommands(int16_t forward, int16_t turn, int16_t *leftCmd, int16_t *rightCmd) {
-  // forward: 16-bit signed, scaled by 100 (e.g., 64 means 0.64 m/s)
-  // turn: 16-bit signed, scaled by 100 (e.g., -128 means -1.28 rad/s)
-  
-  // Convert forward speed to mm/s:
+  // Convert forward speed (scaled by 100) to mm/s
   float forwardSpeed = (forward / 100.0) * 1000.0;
-  // Compute wheel circumference (mm)
   float wheelCircumference = WHEEL_DIAMETER * 3.14159;
-  // Compute target RPM from forward speed:
+  
+  // Calculate the target RPM based on forward speed
   float targetRPM = (forwardSpeed / wheelCircumference) * 60.0;
   
-  // Convert turn rate (in rad/s) and compute the differential term:
+  // Calculate the differential adjustment based on the turn rate (scaled by 100)
   float omega = turn / 100.0;
   float delta = (omega * TRACK_WIDTH * 60.0) / (2.0 * wheelCircumference);
   
-  float leftRPM = targetRPM - delta;
+  // **Note the inversion for the left motor:**
+  // For forward motion, left motor must run with a negative RPM.
+  float leftRPM = -(targetRPM - delta);
   float rightRPM = targetRPM + delta;
   
-  // Convert RPM to command value (multiply by 10)
+  // Convert the RPM values to the motor command scale (RPM * 10)
   *leftCmd = (int16_t)(leftRPM * 10);
   *rightCmd = (int16_t)(rightRPM * 10);
   
-  // Clamp to allowed motor range:
+  // Clamp the commands to the allowed motor range
   if (*leftCmd > MAX_SPEED) *leftCmd = MAX_SPEED;
   if (*leftCmd < -MAX_SPEED) *leftCmd = -MAX_SPEED;
   if (*rightCmd > MAX_SPEED) *rightCmd = MAX_SPEED;
   if (*rightCmd < -MAX_SPEED) *rightCmd = -MAX_SPEED;
 }
+
 
 // ---------------------------------------------------------------------
 // Integrate Robot Position Using Motor Feedback
@@ -295,29 +295,26 @@ void integratePosition() {
     lastIntegrationTime = currentTime;
     return;
   }
-  float dt = (currentTime - lastIntegrationTime) / 1000.0; // dt in seconds
+  float dt = (currentTime - lastIntegrationTime) / 1000.0; // Time step in seconds
   lastIntegrationTime = currentTime;
   
-  // Use the most recent RPM feedback values
-  float leftRPM = leftFeedbackRpm;
-  float rightRPM = rightFeedbackRpm;
-  
-  // Wheel circumference (mm)
   float wheelCircumference = WHEEL_DIAMETER * 3.14159;
   
-  // Convert RPM to linear speed (mm/s)
-  float vLeft = (leftRPM / 60.0) * wheelCircumference;
-  float vRight = (rightRPM / 60.0) * wheelCircumference;
+  // For position integration, reverse the left motor feedback to get its effective speed
+  // This "undoes" the inversion applied in computeMotorCommands.
+  float vLeft = (-leftFeedbackRpm / 60.0) * wheelCircumference;
+  float vRight = (rightFeedbackRpm / 60.0) * wheelCircumference;
   
-  // Average linear speed (mm/s) and angular velocity (rad/s)
+  // Compute the average linear speed and angular velocity
   float v = (vLeft + vRight) / 2.0;
   float omega = (vRight - vLeft) / TRACK_WIDTH;
   
-  // Update position (posX and posY in mm, theta in radians)
+  // Update the robot's estimated position and orientation
   posX += v * cos(theta) * dt;
   posY += v * sin(theta) * dt;
   theta += omega * dt;
 }
+
 
 // ---------------------------------------------------------------------
 // LED Animation Functions
