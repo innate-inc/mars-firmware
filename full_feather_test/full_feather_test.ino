@@ -427,6 +427,7 @@ void processSerial1Payload(uint8_t *payload) {
     sendMotorCommand(SerialRight, rightCmd);
     
     // Send back a Movement Response with the current position
+    Serial.println("Sending Movement Response");
     sendMovementResponse();
     
   } else if (cmdID == 0x02) { // LED Command
@@ -476,6 +477,7 @@ void sendMovementResponse() {
   
   // Compute CRC over payload bytes 2-8 (7 bytes)
   response[9] = calculate_crc8_maxim(response + 2, 7);
+  Serial.println("Sending Movement Response");
   Serial1.write(response, 10);
 }
 
