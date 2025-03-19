@@ -1,51 +1,47 @@
 #include <Arduino.h>
-#include <Wire.h>
 #include "wiring_private.h"    // Needed for pinPeripheral()
 #include <Adafruit_NeoPixel.h>
 
 // ---------------------------------------------------------------------
 // Constants and Definitions
 // ---------------------------------------------------------------------
-#define MOTOR_ID        0x01           // Motor ID for both motors
-#define WHEEL_DIAMETER  73.0           // Wheel diameter in mm
+#define MOTOR_ID        0x01           // Both motors set to ID 1
+#define WHEEL_DIAMETER  69           // Wheel diameter in mm
 #define MAX_SPEED       2100           // Motor command range: -2100 to 2100
-#define TRACK_WIDTH     140.0          // Distance between the two motors (mm)
+#define TRACK_WIDTH     225          // Distance between the two motors in mm
 
-#define LED_PIN         2              // NeoPixel strip pin
-#define NUM_LEDS        39             // Number of LEDs
+const uint8_t SOM[2] = {0x69, 0x69};   // Start-of-Message marker
 
-#define MOTOR_BUFFER_SIZE 64           // Size of motor feedback buffer
+// LED definitions
+#define LED_PIN     2       // Pin for NeoPixel strip
+#define NUM_LEDS    39       // Number of LEDs
 
-// ------------------ IMU Definitions ------------------
-#define IMU_GYRO_ADDRESS       0x6A         // IMU I2C address
-#define IMU_WHO_AM_I           0x0F         // WHO_AM_I register
-#define IMU_CTRL_REG1_G        0x10         // Gyro control register 1
-#define IMU_OUT_Z_L_G          0x1C         // Gyro Z-axis (low byte) used for heading (yaw)
-#define IMU_GYRO_SENSITIVITY   0.00875      // dps per LSB for ±245 dps
-#define IMU_SAMPLE_COUNT       12000        // Number of samples for bias measurement
+// Motor feedback buffer size
+#define MOTOR_BUFFER_SIZE 64
 
 // ---------------------------------------------------------------------
 // Global Variables
 // ---------------------------------------------------------------------
-// Robot state: position (mm) and heading (theta in radians)
-float posX = 0.0, posY = 0.0, theta = 0.0;
 
-// Latest commands received from host (scaled by 100)
-int16_t latestForwardSpeed = 0;
-int16_t latestTurnRate = 0;
+// Robot state (position and heading)
+float posX = 0.0, posY = 0.0, theta = 0.0; // Position (in mm) and heading (in radians)
+int16_t latestForwardSpeed = 0;           // Latest forward speed command (scaled by 100)
+int16_t latestTurnRate = 0;               // Latest turn rate command (scaled by 100)
 
 // LED state variables
 uint8_t ledMode = 0;      // 0 = Off, 1 = Solid, 2 = Blink, 3 = Ring
-uint16_t ledTime = 300;   // LED time parameter in ms
+uint16_t ledTime = 300;   // Time parameter in ms
 uint8_t ledRed = 0, ledGreen = 0, ledBlue = 0;
+
+// LED animation timing
 unsigned long ledPreviousMillis = 0;
 bool blinkState = false;
 int currentLEDIndex = 0;
 
-// Timing for position integration
+// Integration timing
 unsigned long lastIntegrationTime = 0;
 
-// Motor feedback buffers & variables
+// Motor feedback buffers and state
 uint8_t motorFeedbackBufferLeft[MOTOR_BUFFER_SIZE];
 uint8_t motorFeedbackIndexLeft = 0;
 float leftFeedbackRpm = 0.0;
@@ -56,31 +52,30 @@ uint8_t motorFeedbackIndexRight = 0;
 float rightFeedbackRpm = 0.0;
 bool rightFeedbackReady = false;
 
+// ---------------------------------------------------------------------
 // Serial1 (host) message parser variables
+// ---------------------------------------------------------------------
 enum Serial1ParseState { WAIT_FOR_SOM1, WAIT_FOR_SOM2, READ_PAYLOAD };
 Serial1ParseState serial1State = WAIT_FOR_SOM1;
-uint8_t serial1PayloadBuffer[8];  // 7 data + 1 CRC
+uint8_t serial1PayloadBuffer[8];  // Holds the 8-byte payload (7 data + 1 CRC)
 int serial1PayloadIndex = 0;
 
-// ------------------ IMU Global Variables ------------------
-float imuYaw = 0;       // Integrated yaw in degrees (from IMU)
-float imuBiasZ = 0;     // Gyro Z-axis bias (dps)
-unsigned long previousIMUTime = 0;
+// ---------------------------------------------------------------------
+// Motor UART Setup (as per your sample code)
+// ---------------------------------------------------------------------
 
-// ---------------------------------------------------------------------
-// Motor UART Setup (SERCOM/UART objects)
-// ---------------------------------------------------------------------
-// Left Motor: Using SERCOM4 with TX on PIN_A2 and RX on PIN_A3
+// Left Motor: Using SERCOM4 with TX on PIN_A2 (Pad 0) and RX on PIN_A3 (Pad 1)
 Uart SerialLeft(&sercom4, PIN_A3, PIN_A2, SERCOM_RX_PAD_1, UART_TX_PAD_0);
-// Right Motor: Using SERCOM0 with TX on PIN_A4 and RX on PIN_A1
+// Right Motor: Using SERCOM0 with TX on PIN_A4 (Pad 0) and RX on PIN_A1 (Pad 1)
 Uart SerialRight(&sercom0, PIN_A1, PIN_A4, SERCOM_RX_PAD_1, UART_TX_PAD_0);
 
-// SERCOM interrupt handlers for SerialLeft (SERCOM4)
+// Required SERCOM interrupt handlers for SerialLeft (SERCOM4)
 void SERCOM4_0_Handler() { SerialLeft.IrqHandler(); }
 void SERCOM4_1_Handler() { SerialLeft.IrqHandler(); }
 void SERCOM4_2_Handler() { SerialLeft.IrqHandler(); }
 void SERCOM4_3_Handler() { SerialLeft.IrqHandler(); }
-// SERCOM interrupt handlers for SerialRight (SERCOM0)
+
+// Required SERCOM interrupt handlers for SerialRight (SERCOM0)
 void SERCOM0_0_Handler() { SerialRight.IrqHandler(); }
 void SERCOM0_1_Handler() { SerialRight.IrqHandler(); }
 void SERCOM0_2_Handler() { SerialRight.IrqHandler(); }
@@ -112,14 +107,8 @@ void sendMovementResponse();
 void sendLEDResponse();
 void sendStatusResponse();
 
-void imuWriteRegister(uint8_t reg, uint8_t value);
-uint8_t imuReadRegister(uint8_t reg);
-int16_t imuRead16(uint8_t reg);
-void imuMeasureBias();
-void updateIMUHeading();
-
 // ---------------------------------------------------------------------
-// CRC-8/MAXIM Calculation Function (Polynomial 0x8C, init 0x00)
+// CRC-8/MAXIM Calculation Function (Polynomial 0x8C, initial value 0x00)
 // ---------------------------------------------------------------------
 uint8_t calculate_crc8_maxim(uint8_t *data, int len) {
   uint8_t crc = 0x00;
@@ -143,8 +132,12 @@ void setMotorID(Uart &motorSerial) {
   cmd[0] = 0xAA;
   cmd[1] = 0x55;
   cmd[2] = 0x53;
-  cmd[3] = MOTOR_ID;
-  cmd[4] = 0x00; cmd[5] = 0x00; cmd[6] = 0x00; cmd[7] = 0x00; cmd[8] = 0x00;
+  cmd[3] = MOTOR_ID;  // Set ID to 1
+  cmd[4] = 0x00;
+  cmd[5] = 0x00;
+  cmd[6] = 0x00;
+  cmd[7] = 0x00;
+  cmd[8] = 0x00;
   cmd[9] = calculate_crc8_maxim(cmd, 9);
   for (int i = 0; i < 5; i++) {
     motorSerial.write(cmd, 10);
@@ -157,7 +150,12 @@ void setMotorMode(Uart &motorSerial) {
   cmd[0] = MOTOR_ID;
   cmd[1] = 0xA0;
   cmd[2] = 0x02;  // Speed loop mode
-  cmd[3] = 0x00; cmd[4] = 0x00; cmd[5] = 0x00; cmd[6] = 0x00; cmd[7] = 0x00; cmd[8] = 0x00;
+  cmd[3] = 0x00;
+  cmd[4] = 0x00;
+  cmd[5] = 0x00;
+  cmd[6] = 0x00;
+  cmd[7] = 0x00;
+  cmd[8] = 0x00;
   cmd[9] = calculate_crc8_maxim(cmd, 9);
   motorSerial.write(cmd, 10);
   delay(20);
@@ -172,9 +170,10 @@ void sendMotorCommand(Uart &motorSerial, int16_t speed) {
   cmd[1] = 0x64;  // Drive command
   cmd[2] = (speed >> 8) & 0xFF;
   cmd[3] = speed & 0xFF;
-  cmd[4] = 0x00; cmd[5] = 0x00;
-  cmd[6] = 0x01;  // Acceleration time
-  cmd[7] = 0x00;  // No braking
+  cmd[4] = 0x00;
+  cmd[5] = 0x00;
+  cmd[6] = 0x01;  // Acceleration time = 1ms per 1rpm
+  cmd[7] = 0x00;  // No braking (0xFF for brake)
   cmd[8] = 0x00;
   cmd[9] = calculate_crc8_maxim(cmd, 9);
   motorSerial.write(cmd, 10);
@@ -189,19 +188,24 @@ void processLeftFeedback() {
     if (motorFeedbackIndexLeft < MOTOR_BUFFER_SIZE)
       motorFeedbackBufferLeft[motorFeedbackIndexLeft++] = byteRead;
     else {
+      // If buffer full, shift left to make room.
       for (uint8_t i = 1; i < MOTOR_BUFFER_SIZE; i++)
         motorFeedbackBufferLeft[i - 1] = motorFeedbackBufferLeft[i];
       motorFeedbackBufferLeft[MOTOR_BUFFER_SIZE - 1] = byteRead;
     }
+    
+    // Process complete 10-byte messages
     while (motorFeedbackIndexLeft >= 10) {
       if (calculate_crc8_maxim(motorFeedbackBufferLeft, 9) == motorFeedbackBufferLeft[9]) {
         int16_t speedFeedback = ((int16_t)motorFeedbackBufferLeft[2] << 8) | motorFeedbackBufferLeft[3];
-        leftFeedbackRpm = speedFeedback / 10.0;
+        leftFeedbackRpm = speedFeedback / 10.0;  // Scale: motor feedback is multiplied by 10
         leftFeedbackReady = true;
+        // Remove processed 10 bytes from buffer
         for (uint8_t i = 10; i < motorFeedbackIndexLeft; i++)
           motorFeedbackBufferLeft[i - 10] = motorFeedbackBufferLeft[i];
         motorFeedbackIndexLeft -= 10;
       } else {
+        // If CRC fails, discard one byte and try to re-sync.
         for (uint8_t i = 1; i < motorFeedbackIndexLeft; i++)
           motorFeedbackBufferLeft[i - 1] = motorFeedbackBufferLeft[i];
         motorFeedbackIndexLeft--;
@@ -223,6 +227,7 @@ void processRightFeedback() {
         motorFeedbackBufferRight[i - 1] = motorFeedbackBufferRight[i];
       motorFeedbackBufferRight[MOTOR_BUFFER_SIZE - 1] = byteRead;
     }
+    
     while (motorFeedbackIndexRight >= 10) {
       if (calculate_crc8_maxim(motorFeedbackBufferRight, 9) == motorFeedbackBufferRight[9]) {
         int16_t speedFeedback = ((int16_t)motorFeedbackBufferRight[2] << 8) | motorFeedbackBufferRight[3];
@@ -246,34 +251,43 @@ void processRightFeedback() {
 void processMotorFeedback() {
   processLeftFeedback();
   processRightFeedback();
+  // (For integration, we simply use the latest RPM values.)
 }
 
 // ---------------------------------------------------------------------
-// Compute Motor Commands from Latest Velocity Command
+// Compute Motor Commands from the Latest Velocity Command
 // ---------------------------------------------------------------------
 void computeMotorCommands(int16_t forward, int16_t turn, int16_t *leftCmd, int16_t *rightCmd) {
-  float forwardSpeed = (forward / 100.0) * 1000.0; // Convert to mm/s
+  // Convert forward speed (scaled by 100) to mm/s
+  float forwardSpeed = (forward / 100.0) * 1000.0;
   float wheelCircumference = WHEEL_DIAMETER * 3.14159;
   
+  // Calculate the target RPM based on forward speed
   float targetRPM = (forwardSpeed / wheelCircumference) * 60.0;
   
+  // Calculate the differential adjustment based on the turn rate (scaled by 100)
   float omega = turn / 100.0;
   float delta = (omega * TRACK_WIDTH * 60.0) / (2.0 * wheelCircumference);
   
+  // **Note the inversion for the left motor:**
+  // For forward motion, left motor must run with a negative RPM.
   float leftRPM = -(targetRPM - delta);
   float rightRPM = targetRPM + delta;
   
+  // Convert the RPM values to the motor command scale (RPM * 10)
   *leftCmd = (int16_t)(leftRPM * 10);
   *rightCmd = (int16_t)(rightRPM * 10);
   
+  // Clamp the commands to the allowed motor range
   if (*leftCmd > MAX_SPEED) *leftCmd = MAX_SPEED;
   if (*leftCmd < -MAX_SPEED) *leftCmd = -MAX_SPEED;
   if (*rightCmd > MAX_SPEED) *rightCmd = MAX_SPEED;
   if (*rightCmd < -MAX_SPEED) *rightCmd = -MAX_SPEED;
 }
 
+
 // ---------------------------------------------------------------------
-// Integrate Robot Position Using Motor Feedback and IMU Heading
+// Integrate Robot Position Using Motor Feedback
 // ---------------------------------------------------------------------
 void integratePosition() {
   unsigned long currentTime = millis();
@@ -281,20 +295,34 @@ void integratePosition() {
     lastIntegrationTime = currentTime;
     return;
   }
-  float dt = (currentTime - lastIntegrationTime) / 1000.0;
+  float dt = (currentTime - lastIntegrationTime) / 1000.0; // Time step in seconds
   lastIntegrationTime = currentTime;
   
   float wheelCircumference = WHEEL_DIAMETER * 3.14159;
-  float vLeft = (-leftFeedbackRpm / 60.0) * wheelCircumference;
-  float vRight = (rightFeedbackRpm / 60.0) * wheelCircumference;
+  
+  // Apply deadzone of 0.1 RPM to filter out noise
+  float leftRpmFiltered = (abs(leftFeedbackRpm) < 0.15) ? 0.0 : leftFeedbackRpm;
+  float rightRpmFiltered = (abs(rightFeedbackRpm) < 0.15) ? 0.0 : rightFeedbackRpm;
+  
+  // For position integration, reverse the left motor feedback to get its effective speed
+  // This "undoes" the inversion applied in computeMotorCommands.
+  float vLeft = (-leftRpmFiltered / 60.0) * wheelCircumference;
+  float vRight = (rightRpmFiltered / 60.0) * wheelCircumference;
+  
+  Serial.println("Left Feedback RPM: ");
+  Serial.println(leftRpmFiltered);
+  Serial.println("Right Feedback RPM: ");
+  Serial.println(rightRpmFiltered);
+  // Compute the average linear speed and angular velocity
   float v = (vLeft + vRight) / 2.0;
+  float omega = (vRight - vLeft) / TRACK_WIDTH;
   
-  // Use the IMU’s integrated yaw (converted to radians) for heading.
-  theta = imuYaw * (PI / 180.0);
-  
+  // Update the robot's estimated position and orientation
   posX += v * cos(theta) * dt;
   posY += v * sin(theta) * dt;
+  theta += omega * dt;
 }
+
 
 // ---------------------------------------------------------------------
 // LED Animation Functions
@@ -306,10 +334,10 @@ void resetLEDAnimation() {
 }
 
 void updateLEDStripImmediate() {
-  if (ledMode == 0) {
+  if (ledMode == 0) { // Off
     strip.clear();
     strip.show();
-  } else if (ledMode == 1) {
+  } else if (ledMode == 1) { // Solid
     for (int i = 0; i < NUM_LEDS; i++) {
       strip.setPixelColor(i, strip.Color(ledRed, ledGreen, ledBlue));
     }
@@ -319,25 +347,27 @@ void updateLEDStripImmediate() {
 
 void updateLEDs() {
   unsigned long currentMillis = millis();
+  
   switch (ledMode) {
-    case 0:
+    case 0: // Off – no animation
       break;
-    case 1:
+    case 1: // Solid – static color already set
       break;
-    case 2:
+    case 2: // Blink – toggle on/off every ledTime ms
       if (currentMillis - ledPreviousMillis >= ledTime) {
         ledPreviousMillis = currentMillis;
         blinkState = !blinkState;
         if (blinkState) {
-          for (int i = 0; i < NUM_LEDS; i++)
+          for (int i = 0; i < NUM_LEDS; i++) {
             strip.setPixelColor(i, strip.Color(ledRed, ledGreen, ledBlue));
+          }
         } else {
           strip.clear();
         }
         strip.show();
       }
       break;
-    case 3:
+    case 3: // Ring – one LED on at a time, moving around the strip
       if (currentMillis - ledPreviousMillis >= ledTime) {
         ledPreviousMillis = currentMillis;
         currentLEDIndex = (currentLEDIndex + 1) % NUM_LEDS;
@@ -373,9 +403,15 @@ void processSerial1Messages() {
       case READ_PAYLOAD:
         serial1PayloadBuffer[serial1PayloadIndex++] = byteRead;
         if (serial1PayloadIndex == 8) {
+          // Check CRC over first 7 bytes of payload
           uint8_t crcCalc = calculate_crc8_maxim(serial1PayloadBuffer, 7);
-          if (crcCalc == serial1PayloadBuffer[7])
+          if (crcCalc == serial1PayloadBuffer[7]) {
+            // Process valid payload
             processSerial1Payload(serial1PayloadBuffer);
+          } else {
+            // CRC error; optionally print debug info
+            // Serial.println("Serial1 message CRC error.");
+          }
           serial1State = WAIT_FOR_SOM1;
         }
         break;
@@ -386,20 +422,24 @@ void processSerial1Messages() {
 void processSerial1Payload(uint8_t *payload) {
   uint8_t cmdID = payload[0];
   if (cmdID == 0x01) { // Movement Command
+    // Bytes 1-2: forward speed, Bytes 3-4: turn rate
     int16_t forwardSpeed = ((int16_t)payload[1] << 8) | payload[2];
     int16_t turnRate = ((int16_t)payload[3] << 8) | payload[4];
     latestForwardSpeed = forwardSpeed;
     latestTurnRate = turnRate;
     
+    // Compute and send motor commands immediately
     int16_t leftCmd, rightCmd;
     computeMotorCommands(latestForwardSpeed, latestTurnRate, &leftCmd, &rightCmd);
     sendMotorCommand(SerialLeft, leftCmd);
     sendMotorCommand(SerialRight, rightCmd);
     
-    Serial.println("Sending Movement Response");
+    // Send back a Movement Response with the current position
+    //Serial.println("Sending Movement Response");
     sendMovementResponse();
     
   } else if (cmdID == 0x02) { // LED Command
+    // Byte 1: LED mode, Bytes 2-3: time parameter, Byte 4: Red, Byte 5: Green, Byte 6: Blue
     ledMode = payload[1];
     ledTime = ((uint16_t)payload[2] << 8) | payload[3];
     ledRed = payload[4];
@@ -407,12 +447,15 @@ void processSerial1Payload(uint8_t *payload) {
     ledBlue = payload[6];
     resetLEDAnimation();
     
+    // For Off or Solid modes, update the strip immediately.
     if (ledMode == 0 || ledMode == 1)
       updateLEDStripImmediate();
       
+    // Send LED Response
     sendLEDResponse();
     
   } else if (cmdID == 0x03) { // Status Request Command
+    // For now, send a status response with zero values.
     sendStatusResponse();
   }
 }
@@ -424,8 +467,11 @@ void sendMovementResponse() {
   uint8_t response[10];
   response[0] = 0x69;
   response[1] = 0x69;
-  response[2] = 0x81;
+  response[2] = 0x81;  // Movement Response ID
   
+  // Pack x, y, theta into 6 bytes.
+  // For simplicity, posX and posY (in mm) are cast to int16_t.
+  // Theta is scaled by 100 (i.e. in hundredths of a radian).
   int16_t x_fixed = (int16_t) posX;
   int16_t y_fixed = (int16_t) posY;
   int16_t theta_fixed = (int16_t)(theta * 100);
@@ -437,8 +483,9 @@ void sendMovementResponse() {
   response[7] = (theta_fixed >> 8) & 0xFF;
   response[8] = theta_fixed & 0xFF;
   
+  // Compute CRC over payload bytes 2-8 (7 bytes)
   response[9] = calculate_crc8_maxim(response + 2, 7);
-  Serial.println("Sending Movement Response");
+  //Serial.println("Sending Movement Response");
   Serial1.write(response, 10);
 }
 
@@ -449,7 +496,7 @@ void sendLEDResponse() {
   uint8_t response[10];
   response[0] = 0x69;
   response[1] = 0x69;
-  response[2] = 0x82;
+  response[2] = 0x82;  // LED Response ID
   
   response[3] = ledMode;
   response[4] = ledRed;
@@ -469,8 +516,9 @@ void sendStatusResponse() {
   uint8_t response[10];
   response[0] = 0x69;
   response[1] = 0x69;
-  response[2] = 0x83;
+  response[2] = 0x83;  // Status Response ID
   
+  // Battery Voltage (2 bytes), Motor Temperature (2 bytes), Fault Code (1 byte), Reserved (1 byte)
   uint16_t batteryVoltage = 0;  // Not implemented
   uint16_t motorTemp = 0;       // Not implemented
   uint8_t faultCode = 0;
@@ -480,144 +528,89 @@ void sendStatusResponse() {
   response[5] = (motorTemp >> 8) & 0xFF;
   response[6] = motorTemp & 0xFF;
   response[7] = faultCode;
-  response[8] = 0x00;
+  response[8] = 0x00; // Reserved
   
   response[9] = calculate_crc8_maxim(response + 2, 7);
   Serial1.write(response, 10);
 }
 
 // ---------------------------------------------------------------------
-// IMU Functions for Heading Integration
-// ---------------------------------------------------------------------
-void imuWriteRegister(uint8_t reg, uint8_t value) {
-  Wire.beginTransmission(IMU_GYRO_ADDRESS);
-  Wire.write(reg);
-  Wire.write(value);
-  Wire.endTransmission();
-}
-
-uint8_t imuReadRegister(uint8_t reg) {
-  Wire.beginTransmission(IMU_GYRO_ADDRESS);
-  Wire.write(reg);
-  Wire.endTransmission();
-  Wire.requestFrom(IMU_GYRO_ADDRESS, (uint8_t)1);
-  if (Wire.available()) {
-    return Wire.read();
-  }
-  return 0;
-}
-
-int16_t imuRead16(uint8_t reg) {
-  uint8_t low = 0, high = 0;
-  Wire.beginTransmission(IMU_GYRO_ADDRESS);
-  Wire.write(reg);
-  Wire.endTransmission();
-  Wire.requestFrom(IMU_GYRO_ADDRESS, (uint8_t)2);
-  if (Wire.available() >= 2) {
-    low = Wire.read();
-    high = Wire.read();
-  }
-  return (int16_t)(high << 8 | low);
-}
-
-void imuMeasureBias() {
-  long sumZ = 0;
-  for (int i = 0; i < IMU_SAMPLE_COUNT; i++) {
-    int16_t rawZ = imuRead16(IMU_OUT_Z_L_G);
-    sumZ += rawZ;
-    delay(10);
-  }
-  imuBiasZ = (sumZ / (float)IMU_SAMPLE_COUNT) * IMU_GYRO_SENSITIVITY;
-  Serial.print("IMU Bias Z (dps): ");
-  Serial.println(imuBiasZ);
-}
-
-void updateIMUHeading() {
-  unsigned long currentTime = millis();
-  float dt = (currentTime - previousIMUTime) / 1000.0;
-  previousIMUTime = currentTime;
-  
-  int16_t rawZ = imuRead16(IMU_OUT_Z_L_G);
-  float gyroZ = (rawZ * IMU_GYRO_SENSITIVITY) - imuBiasZ;
-  
-  imuYaw += gyroZ * dt; // Update integrated yaw (degrees)
-}
-
-// ---------------------------------------------------------------------
 // Setup Function
 // ---------------------------------------------------------------------
 void setup() {
-  Serial.begin(115200);
-  Serial.println("Initializing Robot Controller with IMU Heading...");
+  Serial.begin(115200);     // For debugging
+  //while (!Serial);          // Wait for Serial monitor
+  Serial.println("Initializing Robot Controller...");
   
-  Wire.begin();
-  delay(100);
-  
-  // Initialize IMU and check WHO_AM_I
-  uint8_t imuWhoAmI = imuReadRegister(IMU_WHO_AM_I);
-  Serial.print("IMU WHO_AM_I: 0x");
-  Serial.println(imuWhoAmI, HEX);
-  if (imuWhoAmI != 0x68) {
-    Serial.println("IMU sensor not detected!");
-    while(1);
-  }
-  
-  imuWriteRegister(IMU_CTRL_REG1_G, 0x60);  // Configure gyro (normal mode, 119Hz, ±245 dps)
-  delay(100);
-  imuMeasureBias();
-  previousIMUTime = millis();
-  
-  // Initialize robot state
-  posX = 0.0; posY = 0.0; theta = 0.0;
-  latestForwardSpeed = 0; latestTurnRate = 0;
-  
+  // Initialize Serial1 for host communications
   Serial1.begin(115200);
   delay(200);
   
   // Initialize motor UARTs
   SerialLeft.begin(115200);
   delay(200);
-  pinPeripheral(PIN_A2, PIO_SERCOM_ALT);
-  pinPeripheral(PIN_A3, PIO_SERCOM_ALT);
+  pinPeripheral(PIN_A2, PIO_SERCOM_ALT);  // Set A2 as TX for SERCOM4
+  pinPeripheral(PIN_A3, PIO_SERCOM_ALT);  // Set A3 as RX for SERCOM4
   
   SerialRight.begin(115200);
   delay(200);
-  pinPeripheral(PIN_A4, PIO_SERCOM_ALT);
-  pinPeripheral(PIN_A1, PIO_SERCOM_ALT);
+  pinPeripheral(PIN_A4, PIO_SERCOM_ALT);  // Set A4 as TX for SERCOM0
+  pinPeripheral(PIN_A1, PIO_SERCOM_ALT);  // Set A1 as RX for SERCOM0
   
-  // Initialize LED strip
+  Serial.println("Serial1, SerialLeft, and SerialRight initialized.");
+  delay(200);
+  // Initialize the LED strip
   strip.begin();
   strip.clear();
   strip.show();
   
-  // Motor initialization
+  // Motor initialization: set motor IDs and mode.
   setMotorID(SerialLeft);
   setMotorID(SerialRight);
   delay(100);
   setMotorMode(SerialLeft);
   setMotorMode(SerialRight);
-  Serial.println("Motors initialized.");
+  Serial.println("Motors initialized to ID 1 and speed loop mode.");
+  
+  // Initialize robot state variables
+  posX = 0.0;
+  posY = 0.0;
+  theta = 0.0;
+  latestForwardSpeed = 0;
+  latestTurnRate = 0;
+  
+  // Initialize LED state variables
+  ledMode = 0;
+  ledTime = 300;
+  ledRed = 0;
+  ledGreen = 0;
+  ledBlue = 0;
+  resetLEDAnimation();
   
   lastIntegrationTime = millis();
 }
 
 // ---------------------------------------------------------------------
-// Main Loop
+// Main Loop Function
 // ---------------------------------------------------------------------
 void loop() {
+  // Process all incoming host commands on Serial1
   processSerial1Messages();
   
+  // Re-send motor commands based on the latest velocity command (to maintain motion)
   int16_t leftCmd, rightCmd;
   computeMotorCommands(latestForwardSpeed, latestTurnRate, &leftCmd, &rightCmd);
   sendMotorCommand(SerialLeft, leftCmd);
   sendMotorCommand(SerialRight, rightCmd);
   
+  // Process motor feedback from both motors
   processMotorFeedback();
   
-  updateIMUHeading();
+  // Integrate the motor feedback to update the robot's position
   integratePosition();
   
+  // Update LED animations (for Blink and Ring modes)
   updateLEDs();
   
-  delay(5);
+  delay(5);  // Small delay to yield time to other tasks
 }
