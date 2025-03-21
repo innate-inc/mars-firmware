@@ -8,7 +8,7 @@
 #define MOTOR_ID        0x01           // Both motors set to ID 1
 #define WHEEL_DIAMETER  69           // Wheel diameter in mm
 #define MAX_SPEED       2100           // Motor command range: -2100 to 2100
-#define TRACK_WIDTH     225          // Distance between the two motors in mm
+#define TRACK_WIDTH     189          // Distance between the two motors in mm
 
 const uint8_t SOM[2] = {0x69, 0x69};   // Start-of-Message marker
 
@@ -315,7 +315,7 @@ void integratePosition() {
   Serial.println(rightRpmFiltered);
   // Compute the average linear speed and angular velocity
   float v = (vLeft + vRight) / 2.0;
-  float omega = (vRight - vLeft) / TRACK_WIDTH;
+  float omega = (-vRight + vLeft) / TRACK_WIDTH;
   
   // Update the robot's estimated position and orientation
   posX += v * cos(theta) * dt;
