@@ -1,6 +1,6 @@
 #include "LEDControl.h"
 
-LEDControl::LEDControl(uint8_t pin = 2, uint16_t numLeds = 39)
+LEDControl::LEDControl(uint8_t pin, uint16_t numLeds)
   : strip(numLeds, pin, NEO_GRB + NEO_KHZ800),
     mode(LedMode::Off), interval(300),
     red(0), green(0), blue(0),
