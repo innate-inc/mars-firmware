@@ -9,7 +9,7 @@ enum class LedMode : uint8_t { Off = 0, Solid, Blink, Ring };
 class LEDControl {
 public:
   // Constructor: specify data pin and number of LEDs
-  LEDControl(uint8_t pin, uint16_t numLeds);
+  LEDControl(uint8_t pin = 2, uint16_t numLeds = 39);
 
   // Initialize the strip (call in setup)
   void begin();
