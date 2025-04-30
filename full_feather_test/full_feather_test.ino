@@ -309,10 +309,10 @@ void integratePosition() {
   float vLeft = (-leftRpmFiltered / 60.0) * wheelCircumference;
   float vRight = (rightRpmFiltered / 60.0) * wheelCircumference;
   
-  Serial.println("Left Feedback RPM: ");
-  Serial.println(leftRpmFiltered);
-  Serial.println("Right Feedback RPM: ");
-  Serial.println(rightRpmFiltered);
+  //Serial.println("Left Feedback RPM: ");
+  //Serial.println(leftRpmFiltered);
+  //Serial.println("Right Feedback RPM: ");
+  //Serial.println(rightRpmFiltered);
   // Compute the average linear speed and angular velocity
   float v = (vLeft + vRight) / 2.0;
   float omega = (-vRight + vLeft) / TRACK_WIDTH;
