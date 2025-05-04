@@ -36,8 +36,8 @@ bool magOffsetSet = false;
 float magHeadingOffset = 0.0;
 
 // Magnetometer Calibration Constants
-const float magOffsetX = -1750.00f;
-const float magOffsetY = 3000.00f;
+const float magOffsetX = -2550.00f;
+const float magOffsetY = 4404.00f;
 const float magScaleX = 0.99f;
 const float magScaleY = 1.01f;
 
@@ -641,6 +641,11 @@ void loop() {
     // Apply calibration to raw magnetometer readings
     float calibratedMagX = (imu.mx - magOffsetX) * magScaleX;
     float calibratedMagY = (imu.my - magOffsetY) * magScaleY;
+
+    // Print the magnitude of the calibrated vector
+    float magMagnitude = sqrt(calibratedMagX*calibratedMagX + calibratedMagY*calibratedMagY);
+    Serial.print("Calibrated Mag Magnitude: ");
+    Serial.println(magMagnitude);
 
     // Apply existing axis swap/negation for heading calculation
     // Note: magX uses calibrated Y, magY uses calibrated X due to sensor orientation/mounting
