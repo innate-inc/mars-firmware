@@ -120,6 +120,7 @@ void processSerial1Payload(uint8_t *payload);
 void sendMovementResponse();
 void sendLEDResponse();
 void sendStatusResponse();
+void sendCalibrationResponse(uint8_t status);
 void initializeIMU();    // Added prototype
 void updateHeadingFromIMU(); // Added prototype
 
@@ -470,6 +471,27 @@ void processSerial1Payload(uint8_t *payload) {
   } else if (cmdID == 0x03) { // Status Request Command
     // For now, send a status response with zero values.
     sendStatusResponse();
+  } else if (cmdID == 0x04) { // Calibration Command
+    // Reset odometry
+    posX = 0.0;
+    posY = 0.0;
+    theta = 0.0;
+    lastIntegrationTime = millis(); // Reset integration timer as well
+
+    // Perform IMU calibration and reset Mahony filter
+    Serial.println("Calibration command received. Recalibrating IMU and resetting filter...");
+    imu.calibrate(); // Recalibrates accel and gyro
+    
+    // Re-instantiate the Mahony object to reset its internal state
+    mahony = Mahony(); 
+    // Then, call begin() to set the sample frequency
+    mahony.begin(IMU_UPDATE_RATE); 
+    
+    lastImuUpdateTime = millis(); // Reset IMU update timer
+    Serial.println("IMU recalibration and filter reset complete.");
+
+    // Send Calibration Response (Success)
+    sendCalibrationResponse(0); // 0 = Success
   }
 }
 
@@ -543,6 +565,27 @@ void sendStatusResponse() {
   response[7] = faultCode;
   response[8] = 0x00; // Reserved
   
+  response[9] = calculate_crc8_maxim(response + 2, 7);
+  Serial1.write(response, 10);
+}
+
+// ---------------------------------------------------------------------
+// Send Calibration Response (Response ID 0x84) - New Function
+// ---------------------------------------------------------------------
+void sendCalibrationResponse(uint8_t status) {
+  uint8_t response[10];
+  response[0] = 0x69;
+  response[1] = 0x69;
+  response[2] = 0x84;  // Calibration Response ID
+
+  response[3] = status; // 0 = Success, 1 = In Progress, 2 = Failure
+  response[4] = 0x00;   // Reserved
+  response[5] = 0x00;   // Reserved
+  response[6] = 0x00;   // Reserved
+  response[7] = 0x00;   // Reserved
+  response[8] = 0x00;   // Reserved
+
+  // Compute CRC over payload bytes 2-8 (7 bytes)
   response[9] = calculate_crc8_maxim(response + 2, 7);
   Serial1.write(response, 10);
 }
