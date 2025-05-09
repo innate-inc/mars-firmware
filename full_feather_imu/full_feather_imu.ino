@@ -471,27 +471,25 @@ void processSerial1Payload(uint8_t *payload) {
   } else if (cmdID == 0x03) { // Status Request Command
     // For now, send a status response with zero values.
     sendStatusResponse();
-  } else if (cmdID == 0x04) { // Calibration Command
+  } else if (cmdID == 0x04) { // Calibration Command (Now System Reset)
     // Reset odometry
     posX = 0.0;
     posY = 0.0;
     theta = 0.0;
     lastIntegrationTime = millis(); // Reset integration timer as well
 
-    // Perform IMU calibration and reset Mahony filter
-    Serial.println("Calibration command received. Recalibrating IMU and resetting filter...");
-    imu.calibrate(); // Recalibrates accel and gyro
+    Serial.println("Calibration command received. Triggering system reset...");
+    // The system will reset, so sending a response after this is not possible.
+    // If a response is needed, it should be sent *before* the reset.
+    // For now, we'll just reset.
     
-    // Re-instantiate the Mahony object to reset its internal state
-    mahony = Mahony(); 
-    // Then, call begin() to set the sample frequency
-    mahony.begin(IMU_UPDATE_RATE); 
-    
-    lastImuUpdateTime = millis(); // Reset IMU update timer
-    Serial.println("IMU recalibration and filter reset complete.");
+    // Wait for serial print to complete (optional, but good practice)
+    Serial.flush(); 
+    delay(100); // Give a short delay for any pending serial data
 
-    // Send Calibration Response (Success)
-    sendCalibrationResponse(0); // 0 = Success
+    NVIC_SystemReset(); // Perform a software reset
+    
+    // Code below this line will not be executed after NVIC_SystemReset()
   }
 }
 
