@@ -17,6 +17,12 @@
 #define LSM9DS1_AG	    0x6B // Accel/Gyro I2C address
 #define IMU_UPDATE_RATE 100  // Update rate in Hz for IMU and Mahony filter
 
+// Battery voltage reading definitions
+#define BATTERY_PIN     A5            // Analog input pin for battery voltage
+#define VREF            3.3           // ADC reference voltage (3.3 V)
+#define R_TOP           13.3          // Top resistor in kΩ
+#define R_BOTTOM        4.7           // Bottom resistor in kΩ
+
 const uint8_t SOM[2] = {0x69, 0x69};   // Start-of-Message marker
 
 // LED definitions
@@ -123,6 +129,7 @@ void sendStatusResponse();
 void sendCalibrationResponse(uint8_t status);
 void initializeIMU();    // Added prototype
 void updateHeadingFromIMU(); // Added prototype
+float readBatteryVoltage(); // Added prototype for battery voltage reading
 
 // ---------------------------------------------------------------------
 // CRC-8/MAXIM Calculation Function (Polynomial 0x8C, initial value 0x00)
@@ -551,8 +558,10 @@ void sendStatusResponse() {
   response[1] = 0x69;
   response[2] = 0x83;  // Status Response ID
   
-  // Battery Voltage (2 bytes), Motor Temperature (2 bytes), Fault Code (1 byte), Reserved (1 byte)
-  uint16_t batteryVoltage = 0;  // Not implemented
+  // Read battery voltage and convert to 16-bit value (scaled by 100, e.g., 12.34V -> 1234)
+  float batteryVoltageFloat = readBatteryVoltage();
+  uint16_t batteryVoltage = (uint16_t)(batteryVoltageFloat * 100.0);
+  
   uint16_t motorTemp = 0;       // Not implemented
   uint8_t faultCode = 0;
   
@@ -586,6 +595,22 @@ void sendCalibrationResponse(uint8_t status) {
   // Compute CRC over payload bytes 2-8 (7 bytes)
   response[9] = calculate_crc8_maxim(response + 2, 7);
   Serial1.write(response, 10);
+}
+
+// ---------------------------------------------------------------------
+// Read Battery Voltage Function (New Function)
+// ---------------------------------------------------------------------
+float readBatteryVoltage() {
+  int raw = analogRead(BATTERY_PIN);
+  
+  // Voltage at the divider pin:
+  float pinV = raw * (VREF / 1023.0);
+  
+  // Correct divider factor = (R_TOP + R_BOTTOM) / R_BOTTOM
+  float dividerFactor = (R_TOP + R_BOTTOM) / R_BOTTOM;
+  float sourceV = pinV * dividerFactor;
+
+  return sourceV;
 }
 
 // ---------------------------------------------------------------------
