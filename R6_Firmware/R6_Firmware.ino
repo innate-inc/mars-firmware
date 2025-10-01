@@ -29,7 +29,11 @@
 // Battery monitoring constants (matching reference implementation)
 #define BATTERY_PIN A5        // Analog pin for battery voltage
 #define BUZZER_PIN 4          // Digital pin for low voltage buzzer
-#define LOW_VOLTAGE_THRESHOLD 10.0  // Voltage threshold for buzzer warning
+#define HSSW_EN_PIN 12        // High Side Switch Enable Pin
+#define EFUSE_EN_PIN 13
+#define HSSW_IS_PIN A0
+#define LOW_VOLTAGE_THRESHOLD 10.5  // Voltage threshold for buzzer warning
+#define LOW_VOLTAGE_CUTOFF 10.3     // Voltage threshold for power cutoff
 #define VREF 3.3              // ADC reference voltage (3.3V)
 #define R_TOP 13.3            // Top resistor in kΩ (matching reference)
 #define R_BOTTOM 4.7          // Bottom resistor in kΩ (matching reference)
@@ -68,7 +72,7 @@ int16_t latestTurnCmd = 0;
 void updateBuzzer() {
   // Check if voltage is below threshold
   bool low_voltage = (battery_voltage < LOW_VOLTAGE_THRESHOLD);
-  
+  bool cutoff_voltage = (battery_voltage < LOW_VOLTAGE_CUTOFF);
   if (!low_voltage) {
     // Voltage is OK - turn off buzzer and reset state
     digitalWrite(BUZZER_PIN, LOW);
@@ -77,6 +81,12 @@ void updateBuzzer() {
     buzzer_active = false;
     in_cycle_pause = false;
     return;
+  }
+
+  if (cutoff_voltage) {
+    digitalWrite(HSSW_EN_PIN, LOW);
+    digitalWrite(EFUSE_EN_PIN, HIGH); // High to pull the pin low
+    digitalWrite(BUZZER_PIN, HIGH); // assert buzzer on constantly when below cutoff
   }
   
   // Low voltage detected - manage buzzer pattern
@@ -279,8 +289,8 @@ void processCommand() {
   
   if (!boot_latch) {
     boot_latch = true;
-    pinMode(12, OUTPUT);
-    digitalWrite(12, HIGH);
+    pinMode(HSSW_EN_PIN, OUTPUT);
+    digitalWrite(HSSW_EN_PIN, HIGH);
   }
   
   // Verify CRC
@@ -380,8 +390,8 @@ void setup() {
   }
 
   // Set status LED and buzzer pin
-  pinMode(12, OUTPUT);
-  digitalWrite(12, HIGH);
+  pinMode(HSSW_EN_PIN, OUTPUT);
+  digitalWrite(HSSW_EN_PIN, HIGH);
   
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);  // Start with buzzer off
@@ -401,8 +411,6 @@ void setup() {
 
 // ---------------------------------------------------------------------
 void loop() {
-  // Maintain pin 12 HIGH
-  // digitalWrite(12, HIGH);
   
   // Update IMU readings
   imuControl.update();
@@ -422,12 +430,12 @@ void loop() {
   motorControl.processFeedback();
   
   // Check for new RPM data (optional - for debugging)
-  if (motorControl.available()) {
-    // Serial.print("Motor RPM - Left: ");
-    // Serial.print(motorControl.getLeftRPM());
-    // Serial.print(", Right: ");
-    // Serial.println(motorControl.getRightRPM());
-  }
+  // if (motorControl.available()) {
+  //   Serial.print("Motor RPM - Left: ");
+  //   Serial.print(motorControl.getLeftRPM());
+  //   Serial.print(", Right: ");
+  //   Serial.println(motorControl.getRightRPM());
+  // }
   
   // Update buzzer for low voltage warning (independent of Jetson communication)
   updateBuzzer();
