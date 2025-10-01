@@ -82,8 +82,8 @@ void MotorControl::executeCommand(int16_t speed_cmd, int16_t turn_cmd) {
   
   // **FIXED: Correct motor directions for forward motion**
   // For forward motion, both motors should run in the same direction
-  float leftRPM = targetRPM - delta;   // Remove the negative sign
-  float rightRPM = targetRPM + delta;
+  float leftRPM = targetRPM + delta;   // Remove the negative sign
+  float rightRPM = targetRPM - delta;
   
   // Convert the RPM values to the motor command scale (RPM * 10)
   int16_t left_speed = (int16_t)(leftRPM * 10);
