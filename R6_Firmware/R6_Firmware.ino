@@ -30,10 +30,11 @@
 #define BATTERY_PIN A5        // Analog pin for battery voltage
 #define BUZZER_PIN 4          // Digital pin for low voltage buzzer
 #define HSSW_EN_PIN 12        // High Side Switch Enable Pin
-#define EFUSE_EN_PIN 13
+#define EFUSE_EN_PIN 10
 #define HSSW_IS_PIN A0
 #define LOW_VOLTAGE_THRESHOLD 10.5  // Voltage threshold for buzzer warning
 #define LOW_VOLTAGE_CUTOFF 10.3     // Voltage threshold for power cutoff
+#define HYSTERESIS_THRESHOLD 11.0   // Voltage threshold for hysteresis to eliminate repeated threshold crossing
 #define VREF 3.3              // ADC reference voltage (3.3V)
 #define R_TOP 13.3            // Top resistor in kΩ (matching reference)
 #define R_BOTTOM 4.7          // Bottom resistor in kΩ (matching reference)
@@ -50,6 +51,8 @@ uint8_t fault_code = 0;       // No faults initially
 uint8_t calibration_status = 0; // 0=Success, 1=In Progress, 2=Failure
 bool calibration_in_progress = false; // Flag to prevent IMU updates during calibration
 bool boot_latch = false; //Flag to ensure HSSW EN pin is high
+bool hysteresis_triggered = false; // Flag for hysteresis
+bool cutoff_triggered = false;  // Flag for cutoff specifically
 
 // Low voltage buzzer variables
 unsigned long buzzer_start_time = 0;
@@ -70,11 +73,11 @@ int16_t latestTurnCmd = 0;
 // ---------------------------------------------------------------------
 // Low voltage buzzer management
 void updateBuzzer() {
-  // Check if voltage is below threshold
-  bool low_voltage = (battery_voltage < LOW_VOLTAGE_THRESHOLD);
-  bool cutoff_voltage = (battery_voltage < LOW_VOLTAGE_CUTOFF);
-  if (!low_voltage) {
-    // Voltage is OK - turn off buzzer and reset state
+  // Check recovery condition first (hysteresis)
+  if (battery_voltage >= HYSTERESIS_THRESHOLD) {
+    hysteresis_triggered = false;
+    cutoff_triggered = false;
+    // Voltage recovered - turn off buzzer and reset state
     digitalWrite(BUZZER_PIN, LOW);
     buzzer_state = BUZZER_OFF;
     buzz_count = 0;
@@ -82,14 +85,34 @@ void updateBuzzer() {
     in_cycle_pause = false;
     return;
   }
-
-  if (cutoff_voltage) {
-    digitalWrite(HSSW_EN_PIN, LOW);
-    digitalWrite(EFUSE_EN_PIN, HIGH); // High to pull the pin low
-    digitalWrite(BUZZER_PIN, HIGH); // assert buzzer on constantly when below cutoff
+  
+  // Latch the triggered states
+  if (battery_voltage < LOW_VOLTAGE_THRESHOLD) {
+    hysteresis_triggered = true;
+  }
+  if (battery_voltage < LOW_VOLTAGE_CUTOFF) {
+    cutoff_triggered = true;
   }
   
-  // Low voltage detected - manage buzzer pattern
+  // If hysteresis not triggered, everything is OK
+  if (!hysteresis_triggered) {
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzer_state = BUZZER_OFF;
+    buzz_count = 0;
+    buzzer_active = false;
+    in_cycle_pause = false;
+    return;
+  }
+  
+  // Critical cutoff triggered - constant beep and power off
+  if (cutoff_triggered) {
+    digitalWrite(HSSW_EN_PIN, LOW);
+    digitalWrite(EFUSE_EN_PIN, LOW);
+    digitalWrite(BUZZER_PIN, HIGH); // assert buzzer on constantly when below cutoff
+    return;  // Stay in cutoff state until voltage recovers above hysteresis
+  }
+  
+  // Low voltage warning mode - manage buzzer pattern
   unsigned long current_time = millis();
   
   switch (buzzer_state) {
@@ -392,6 +415,9 @@ void setup() {
   // Set status LED and buzzer pin
   pinMode(HSSW_EN_PIN, OUTPUT);
   digitalWrite(HSSW_EN_PIN, HIGH);
+
+  pinMode(EFUSE_EN_PIN, OUTPUT);
+  digitalWrite(EFUSE_EN_PIN, HIGH);
   
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);  // Start with buzzer off
