@@ -32,7 +32,7 @@
 #define BATTERY_PIN A5        // Analog pin for battery voltage
 #define BUZZER_PIN 4          // Digital pin for low voltage buzzer
 #define HSSW_EN_PIN 12        // High Side Switch Enable Pin
-#define EFUSE_EN_PIN 10
+#define EFUSE_EN_PIN 5
 #define HSSW_IS_PIN A0
 #define LOW_VOLTAGE_THRESHOLD 10.5  // Voltage threshold for buzzer warning
 #define LOW_VOLTAGE_CUTOFF 10.3     // Voltage threshold for power cutoff
@@ -91,6 +91,8 @@ void updateBuzzer() {
     cutoff_triggered = false;
     // Voltage recovered - turn off buzzer and reset state
     digitalWrite(BUZZER_PIN, LOW);
+    digitalWrite(HSSW_EN_PIN, HIGH);
+    digitalWrite(EFUSE_EN_PIN, HIGH);
     buzzer_state = BUZZER_OFF;
     buzz_count = 0;
     buzzer_active = false;
@@ -191,6 +193,18 @@ void updateReset() {
     if (reset_target & RESET_EFUSE) {
       digitalWrite(EFUSE_EN_PIN, HIGH);
       Serial.println("EFUSE restored");
+    }
+
+    // Send completion response only for HSSW-only reset
+    // (EFUSE and BOTH cause full system restart, so no response needed)
+    if (reset_target == RESET_HSSW) {
+      response_buffer[0] = RESP_RESET;
+      response_buffer[1] = 0x02;        // Status: 0x02 = Completed
+      response_buffer[2] = RESET_HSSW;  // Target that was reset
+      memset(&response_buffer[3], 0x00, 4); // Clear reserved bytes
+      response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
+      response_ready = true;
+      Serial.println("HSSW reset completion response prepared");
     }
     
     reset_in_progress = false;
