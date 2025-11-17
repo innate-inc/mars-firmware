@@ -19,11 +19,13 @@
 #define CMD_MOVE 0x01
 #define CMD_STATUS 0x03
 #define CMD_CALIBRATE 0x04
+#define CMD_RESET 0x05
 
 // Response definitions (MCU → Jetson)
 #define RESP_MOVE 0x81      // Position feedback
 #define RESP_STATUS 0x83    // Health data
 #define RESP_CALIBRATE 0x84 // Calibration status
+#define RESP_RESET 0x85     // Component Reset
 
 // ---------------------------------------------------------------------
 // Battery monitoring constants (matching reference implementation)
@@ -39,6 +41,11 @@
 #define R_TOP 13.3            // Top resistor in kΩ (matching reference)
 #define R_BOTTOM 4.7          // Bottom resistor in kΩ (matching reference)
 #define ADC_MAX_VALUE 4095.0  // 12-bit ADC resolution (ItsyBitsy M4)
+
+#define RESET_NONE 0x00
+#define RESET_HSSW 0x01
+#define RESET_EFUSE 0x02
+#define RESET_BOTH 0x03
 
 // ---------------------------------------------------------------------
 // Global objects
@@ -69,6 +76,11 @@ uint8_t response_buffer[8];
 bool response_ready = false;
 int16_t latestSpeedCmd = 0;
 int16_t latestTurnCmd = 0;
+
+// Reset Variables
+uint8_t reset_target = RESET_NONE;
+unsigned long reset_start_time = 0;
+bool reset_in_progress = false;
 
 // ---------------------------------------------------------------------
 // Low voltage buzzer management
@@ -163,6 +175,27 @@ void updateBuzzer() {
         Serial.println("Starting new buzzer cycle");
       }
       break;
+  }
+}
+
+void updateReset() {
+  if (!reset_in_progress) return;
+  
+  // Check if 1 second has elapsed
+  if (millis() - reset_start_time >= 1000) {
+    // Restore the enable pins
+    if (reset_target & RESET_HSSW) {
+      digitalWrite(HSSW_EN_PIN, HIGH);
+      Serial.println("HSSW restored");
+    }
+    if (reset_target & RESET_EFUSE) {
+      digitalWrite(EFUSE_EN_PIN, HIGH);
+      Serial.println("EFUSE restored");
+    }
+    
+    reset_in_progress = false;
+    reset_target = RESET_NONE;
+    Serial.println("Reset complete");
   }
 }
 
@@ -383,6 +416,47 @@ void processCommand() {
 
     // NVIC_SystemReset(); // Perform a software reset
     
+  } else if (cmd_id == CMD_RESET) {
+    if (cutoff_triggered) {
+        Serial.println("Reset ignored due to low-voltage cutoff");
+
+        response_buffer[0] = RESP_RESET;
+        response_buffer[1] = 0x00;        // 0 = not accepted / not started
+        response_buffer[2] = RESET_NONE;  // No reset performed
+        memset(&response_buffer[3], 0x00, 4);
+        response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
+        response_ready = true;
+
+        return;
+    }
+    uint8_t target = i2c_buffer[1]; // Which device(s) to reset
+    
+    Serial.print("Reset command - Target: 0x");
+    Serial.println(target, HEX);
+    
+    if (!reset_in_progress && target >= RESET_HSSW && target <= RESET_BOTH) {
+      // Start the reset cycle
+      reset_target = target;
+      reset_start_time = millis();
+      reset_in_progress = true;
+      
+      // Turn off requested pins immediately
+      if (target & RESET_HSSW) {
+        digitalWrite(HSSW_EN_PIN, LOW);
+      }
+      if (target & RESET_EFUSE) {
+        digitalWrite(EFUSE_EN_PIN, LOW);
+      }
+    }
+    
+    // Send response
+    response_buffer[0] = RESP_RESET;
+    response_buffer[1] = reset_in_progress ? 0x01 : 0x00;
+    response_buffer[2] = reset_target;
+    memset(&response_buffer[3], 0x00, 4); // Clear reserved bytes
+    response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
+    response_ready = true;
+    
   } else {
     Serial.print("Unknown command ID: 0x");
     Serial.println(cmd_id, HEX);
@@ -465,6 +539,7 @@ void loop() {
   
   // Update buzzer for low voltage warning (independent of Jetson communication)
   updateBuzzer();
+  updateReset();
   
   // Update system status periodically
   static unsigned long last_status_update = 0;
