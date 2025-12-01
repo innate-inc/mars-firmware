@@ -32,7 +32,7 @@
 #define BATTERY_PIN A5        // Analog pin for battery voltage
 #define BUZZER_PIN 4          // Digital pin for low voltage buzzer
 #define HSSW_EN_PIN 12        // High Side Switch Enable Pin
-#define EFUSE_EN_PIN 5
+#define EFUSE_EN_PIN 10
 #define HSSW_IS_PIN A0
 #define LOW_VOLTAGE_THRESHOLD 10.5  // Voltage threshold for buzzer warning
 #define LOW_VOLTAGE_CUTOFF 10.3     // Voltage threshold for power cutoff
