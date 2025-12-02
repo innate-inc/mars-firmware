@@ -1,5 +1,5 @@
 /*
- * Enhanced I2C Motor Controller Slave - Adafruit ItsyBitsy M4 Express
+ * I2C Motor Controller Follower - Adafruit ItsyBitsy M4 Express
  * Receives motor commands via I2C from Jetson Orin Nano
  * Uses modular MotorControl, IMUControl, and Utils classes
  * Provides bidirectional communication with position feedback and status
@@ -13,7 +13,7 @@
 
 // ---------------------------------------------------------------------
 // I2C Configuration
-#define I2C_SLAVE_ADDRESS 0x42  // Must match MCU_ADDR in Jetson code
+#define I2C_FOLLOWER_ADDRESS 0x42  // Must match MCU_ADDR in Jetson code
 
 // Command definitions (Jetson → MCU)
 #define CMD_MOVE 0x01
@@ -140,7 +140,7 @@ void updateBuzzer() {
       break;
       
     case BUZZER_ON:
-      // Check if 1 second on time elapsed
+      // Check if time elapsed
       if (current_time - buzzer_start_time >= 1000) {
         digitalWrite(BUZZER_PIN, LOW);
         buzzer_start_time = current_time;
@@ -150,7 +150,7 @@ void updateBuzzer() {
       break;
       
     case BUZZER_PAUSE:
-      // Check if 1 second pause elapsed
+      // Check if pause elapsed
       if (current_time - buzzer_start_time >= 1000) {
         if (buzz_count < 3) {
           // Continue with next buzz
@@ -169,7 +169,7 @@ void updateBuzzer() {
       break;
       
     case CYCLE_PAUSE:
-      // Check if 10 second pause elapsed
+      // Check if pause elapsed
       if (current_time - buzzer_start_time >= 10000) {
         // Reset and start new cycle
         buzz_count = 0;
@@ -259,7 +259,7 @@ void preparePositionResponse() {
 }
 
 void prepareStatusResponse() {
-  // Read actual battery voltage from A5 pin
+  // Read actual battery voltage from pin
   battery_voltage = readBatteryVoltage();
   
   uint16_t battery_scaled = scaleBatteryVoltage(battery_voltage);
@@ -292,7 +292,7 @@ void prepareCalibrateResponse() {
 // ---------------------------------------------------------------------
 // I2C Event Handlers
 
-// Function that executes when data is received from master
+// Function that executes when data is received from leader
 void receiveEvent(int numBytes) {
   if (numBytes == 9) {  // 8-byte command + 1 register byte
     // Read register byte (should be 0x00)
@@ -427,8 +427,6 @@ void processCommand() {
     prepareCalibrateResponse();
     
     Serial.println("Calibration complete - Position and heading reset to 0,0,0");
-
-    // NVIC_SystemReset(); // Perform a software reset
     
   } else if (cmd_id == CMD_RESET) {
     if (cutoff_triggered) {
@@ -482,8 +480,8 @@ void processCommand() {
 // ---------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
-  delay(1000); // Give serial time to initialize without blocking
-  Serial.println("Enhanced I2C Motor Controller Slave Initializing...");
+  delay(1000); // Give serial time to initialize
+  Serial.println("Enhanced I2C Motor Controller Follower Initializing...");
 
   // Set ADC resolution to 12-bit for ItsyBitsy M4
   analogReadResolution(12);
@@ -508,17 +506,17 @@ void setup() {
   digitalWrite(EFUSE_EN_PIN, HIGH);
   
   pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);  // Start with buzzer off
+  digitalWrite(BUZZER_PIN, LOW);
 
   Serial.println("Hardware initialized");
 
-  // Initialize I2C as slave with both receive and request handlers
-  Wire.begin(I2C_SLAVE_ADDRESS);
+  // Initialize I2C as follower with both receive and request handlers
+  Wire.begin(I2C_FOLLOWER_ADDRESS);
   Wire.onReceive(receiveEvent);  // Handle incoming commands
   Wire.onRequest(requestEvent);  // Handle data requests from master
   
-  Serial.print("Enhanced I2C slave ready at address 0x");
-  Serial.println(I2C_SLAVE_ADDRESS, HEX);
+  Serial.print("Enhanced I2C follower ready at address 0x");
+  Serial.println(I2C_FOLLOWER_ADDRESS, HEX);
   Serial.println("Bidirectional communication enabled");
   Serial.println("Waiting for commands from Jetson...");
 }
@@ -529,7 +527,7 @@ void loop() {
   // Update IMU readings
   imuControl.update();
   
-  // Update heading from IMU when available (like working code)
+  // Update heading from IMU when available
   if (!calibration_in_progress && imuControl.isConnected() && imuControl.headingAvailable()) {
     float heading = imuControl.getHeading();
     // Update motor control heading directly
@@ -542,14 +540,6 @@ void loop() {
   motorControl.executeCommand(latestSpeedCmd, latestTurnCmd);
   // Process motor feedback to get actual RPM data
   motorControl.processFeedback();
-  
-  // Check for new RPM data (optional - for debugging)
-  // if (motorControl.available()) {
-  //   Serial.print("Motor RPM - Left: ");
-  //   Serial.print(motorControl.getLeftRPM());
-  //   Serial.print(", Right: ");
-  //   Serial.println(motorControl.getRightRPM());
-  // }
   
   // Update buzzer for low voltage warning (independent of Jetson communication)
   updateBuzzer();

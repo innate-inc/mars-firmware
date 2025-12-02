@@ -65,7 +65,6 @@ void MotorControl::executeCommand(int16_t speed_cmd, int16_t turn_cmd) {
   // Convert Jetson commands to motor speeds using reference implementation logic
   // speed_cmd and turn_cmd are scaled by 100 (e.g., 100 = 1.0 m/s)
   
-  // Scale down forward/backward speed to 1/3 for safety
   float speed_multiplier = 1.0f;  // Reduce speed to 1/3
   float scaled_speed_cmd = speed_cmd * speed_multiplier;
   
@@ -80,9 +79,8 @@ void MotorControl::executeCommand(int16_t speed_cmd, int16_t turn_cmd) {
   float omega = turn_cmd / 100.0;
   float delta = (omega * TRACK_WIDTH * 60.0) / (2.0 * wheelCircumference);
   
-  // **FIXED: Correct motor directions for forward motion**
   // For forward motion, both motors should run in the same direction
-  float leftRPM = targetRPM + delta;   // Remove the negative sign
+  float leftRPM = targetRPM + delta;
   float rightRPM = targetRPM - delta;
   
   // Convert the RPM values to the motor command scale (RPM * 10)
@@ -94,15 +92,11 @@ void MotorControl::executeCommand(int16_t speed_cmd, int16_t turn_cmd) {
   right_speed = constrain(right_speed, -MAX_MOTOR_SPEED, MAX_MOTOR_SPEED);
   
   // Send commands to motors
-  sendMotorSpeeds(left_speed, -right_speed);  // Invert right motor direction
+  sendMotorSpeeds(left_speed, -right_speed);
   
-  // Update position estimate using the CORRECTED motor speeds (not inverted)
+  // Update position estimate
   updatePosition(left_speed, right_speed);  // Use original speeds for position calculation
   
-  // Serial.print("Motor speeds - Left: ");
-  // Serial.print(left_speed);
-  // Serial.print(", Right: ");
-  // Serial.println(right_speed);
 }
 
 void MotorControl::sendMotorSpeeds(int16_t left_speed, int16_t right_speed) {

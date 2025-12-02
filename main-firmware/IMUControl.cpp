@@ -4,7 +4,7 @@
 IMUControl* IMUControl::_instance = nullptr;
 
 IMUControl::IMUControl()
-  : _customI2C(&sercom0, A4, A1), // A4 (SDA), A1 (SCL) using SERCOM0 - copied from working example
+  : _customI2C(&sercom0, A4, A1), // A4 (SDA), A1 (SCL) using SERCOM0
     _currentHeading(0.0f), _headingOffset(0.0f),
     _newHeadingData(false), _initialized(false), _lastUpdateTime(0)
 {
@@ -15,7 +15,7 @@ IMUControl::IMUControl()
 bool IMUControl::begin() {
   Serial.println("Initializing IMU Control...");
   
-  // Initialize custom I2C first (copied from working example)
+  // Initialize custom I2C first
   if (!initializeCustomI2C()) {
     Serial.println("Failed to initialize custom I2C");
     return false;
@@ -125,7 +125,7 @@ bool IMUControl::initializeCustomI2C() {
 bool IMUControl::initializeIMU() {
   bool initialized = false;
   while (!initialized) {
-    // Initialize the ICM-20948 using our custom I2C bus (copied from working example)
+    // Initialize the ICM-20948 using our custom I2C bus
     _imu.begin(_customI2C, 0); // AD0_VAL = 0
 
     Serial.print("Initialization of the sensor returned: ");
@@ -145,22 +145,22 @@ bool IMUControl::initializeIMU() {
 bool IMUControl::initializeDMP() {
   bool success = true; // Use success to show if the DMP configuration was successful
 
-  // Initialize the DMP (copied from working example)
+  // Initialize the DMP
   success &= (_imu.initializeDMP() == ICM_20948_Stat_Ok);
 
-  // Enable the DMP Orientation sensor (9-axis quaternion for heading) - MATCHING WORKING CODE
+  // Enable the DMP Orientation sensor (9-axis quaternion for heading)
   success &= (_imu.enableDMPSensor(INV_ICM20948_SENSOR_ORIENTATION) == ICM_20948_Stat_Ok);
 
-  // Enable the FIFO (copied from working example)
+  // Enable the FIFO 
   success &= (_imu.enableFIFO() == ICM_20948_Stat_Ok);
 
-  // Enable the DMP (copied from working example)
+  // Enable the DMP
   success &= (_imu.enableDMP() == ICM_20948_Stat_Ok);
 
-  // Reset DMP (copied from working example)
+  // Reset DMP
   success &= (_imu.resetDMP() == ICM_20948_Stat_Ok);
 
-  // Reset FIFO (copied from working example)
+  // Reset FIFO
   success &= (_imu.resetFIFO() == ICM_20948_Stat_Ok);
 
   // Check success
@@ -171,20 +171,19 @@ bool IMUControl::initializeDMP() {
     Serial.println("Please check that you have uncommented line 29 (#define ICM_20948_USE_DMP) in ICM_20948_C.h...");
     return false;
   }
-  
   return true;
 }
 
 void IMUControl::processQuaternionData() {
-  // Check if we have Orientation data (9-axis quaternion) - EXACT COPY FROM WORKING CODE
+  // Check if we have Orientation data (9-axis quaternion)
   if ((_dmpData.header & DMP_header_bitmap_Quat9) > 0) {
-    // Extract quaternion components (Q30 format) - EXACT COPY FROM WORKING CODE
+    // Extract quaternion components (Q30 format)
     double q1 = (double)_dmpData.Quat9.Data.Q1 / 1073741824.0;
     double q2 = (double)_dmpData.Quat9.Data.Q2 / 1073741824.0;
     double q3 = (double)_dmpData.Quat9.Data.Q3 / 1073741824.0;
     double q0 = sqrt(1.0 - (q1*q1 + q2*q2 + q3*q3));
 
-    // Heading (yaw) - EXACT COPY FROM WORKING CODE
+    // Heading (yaw)
     double t0 = 2.0 * (q0*q3 + q1*q2);
     double t1 = 1.0 - 2.0 * (q2*q2 + q3*q3);
     double yaw_degrees = atan2(t0, t1) * 180.0 / PI;
@@ -221,7 +220,7 @@ void IMUControl::processQuaternionData() {
 }
 
 
-// SERCOM0 interrupt handler for custom I2C (copied from working example)
+// SERCOM0 interrupt handler for custom I2C
 void SERCOM0_Handler() {
   if (IMUControl::_instance) {
     IMUControl::_instance->_customI2C.onService();

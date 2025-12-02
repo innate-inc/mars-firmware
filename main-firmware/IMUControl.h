@@ -55,7 +55,7 @@ public:
   void getAccelGyro(float &ax, float &ay, float &az, float &gx, float &gy, float &gz);
 
 private:
-  // Custom I2C for ICM-20948 (copied from working example)
+  // Custom I2C for ICM-20948
   TwoWire _customI2C;
   
   // ICM-20948 object
