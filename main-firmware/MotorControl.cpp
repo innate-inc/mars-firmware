@@ -147,19 +147,12 @@ void MotorControl::updatePosition(int16_t left_speed, int16_t right_speed) {
   
   float wheelCircumference = WHEEL_DIAMETER * 3.14159;
   
-  // For position integration, use the actual motor speeds sent (not feedback)
-  // Convert motor speeds back to linear velocities
-  float vLeft = (left_speed / 10.0) / 60.0 * wheelCircumference;  // Convert RPM*10 to mm/s
-  float vRight = (right_speed / 10.0) / 60.0 * wheelCircumference;  // Convert RPM*10 to mm/s
+  // Use actual velocity reported back from the wheels (feedback RPM)
+  float vFbLeft = (_lastLeftRPM / 60.0) * wheelCircumference;   // RPM to mm/s
+  float vFbRight = (-_lastRightRPM / 60.0) * wheelCircumference; // negate (motor reversed)
   
   // Compute the average linear speed (forward/backward motion)
-  float v = (vLeft + vRight) / 2.0;
-  
-  // Compute angular velocity (turning motion)
-  float omega = (vRight - vLeft) / TRACK_WIDTH;
-
-  // Heading is now updated continuously in main loop via updateHeadingFromIMU()
-  // No need to update heading here since it's handled separately
+  float v = (vFbLeft + vFbRight) / 2.0;
   
   // Update the robot's estimated position using the current heading (theta)
   // Convert mm/s to m/s for position storage
@@ -254,7 +247,8 @@ void MotorControl::setMotorMode(Stream &motorSerial) {
 }
 
 void MotorControl::sendMotorCommand(Stream &motorSerial, int16_t speed) {
-  uint8_t cmd[10] = {_motorId, 0x64, 0,0, 0,0, 0x01, 0,0, 0};
+  uint8_t cmd[10] = {_motorId, 0x64, 0,0, 0x01, 0x00, 0x01, 0,0, 0};
+  //                                      fb1=speed       accel
   splitInt16(speed, cmd[2], cmd[3]);
   cmd[9] = calculateCRC(cmd, 9);
   motorSerial.write(cmd, 10);
