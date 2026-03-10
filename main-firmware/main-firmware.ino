@@ -1,3 +1,6 @@
+#define ICM_20948_USE_DMP
+#include <ICM_20948.h>
+
 /*
  * I2C Motor Controller Follower - Adafruit ItsyBitsy M4 Express
  * Receives motor commands via I2C from Jetson Orin Nano
@@ -72,7 +75,7 @@ BuzzerState buzzer_state = BUZZER_OFF;
 // I2C communication variables
 uint8_t i2c_buffer[8];
 bool command_ready = false;
-uint8_t response_buffer[8];
+uint8_t response_buffer[24];
 bool response_ready = false;
 int16_t latestSpeedCmd = 0;
 int16_t latestTurnCmd = 0;
@@ -201,8 +204,8 @@ void updateReset() {
       response_buffer[0] = RESP_RESET;
       response_buffer[1] = 0x02;        // Status: 0x02 = Completed
       response_buffer[2] = RESET_HSSW;  // Target that was reset
-      memset(&response_buffer[3], 0x00, 4); // Clear reserved bytes
-      response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
+      memset(&response_buffer[3], 0x00, 20); // Clear reserved bytes
+      response_buffer[23] = calculateCRC8Maxim(response_buffer, 23);
       response_ready = true;
       Serial.println("HSSW reset completion response prepared");
     }
@@ -230,30 +233,51 @@ float readBatteryVoltage() {
 // ---------------------------------------------------------------------
 // Prepare response functions
 void preparePositionResponse() {
-  // Get current position from motor control
-  float x, y, theta;
-  motorControl.getPosition(x, y, theta);
+  // Get all 3 odom positions + shared theta from motor control
+  float x1, y1, x2, y2, x3, y3, theta;
+  motorControl.getPosition(x1, y1, x2, y2, x3, y3, theta);
   
-  // Convert position to fixed-point format for transmission (matching Jetson expectations)
-  // Position is in meters, convert to cm for transmission (Jetson divides by 100)
-  int16_t x_cm = (int16_t)(x * 100.0);  // Convert to cm
-  int16_t y_cm = (int16_t)(y * 100.0);  // Convert to cm
-  int16_t theta_scaled = (int16_t)(theta * 100.0); // Scale by 100 (hundredths of radian)
+  // Convert to cm (int16_t) for transmission (Jetson divides by 100)
+  int16_t x1_cm = (int16_t)(x1 * 100.0);
+  int16_t y1_cm = (int16_t)(y1 * 100.0);
+  int16_t x2_cm = (int16_t)(x2 * 100.0);
+  int16_t y2_cm = (int16_t)(y2 * 100.0);
+  int16_t x3_cm = (int16_t)(x3 * 100.0);
+  int16_t y3_cm = (int16_t)(y3 * 100.0);
+  int16_t theta_scaled = (int16_t)(theta * 100.0); // hundredths of radian
   
   // Debug output
-  Serial.print("Position - X: ");
-  Serial.print(x_cm);
+  Serial.print("Odom1 - X: ");
+  Serial.print(x1_cm);
   Serial.print("cm, Y: ");
-  Serial.print(y_cm);
+  Serial.print(y1_cm);
   Serial.print("cm, Theta: ");
   Serial.print(theta * 180.0 / PI, 1);
   Serial.println("°");
   
+  // Feedback data
+  int16_t leftRPM_scaled = (int16_t)(motorControl.getLeftRPM() * 10.0f);  // RPM * 10
+  int16_t rightRPM_scaled = (int16_t)(motorControl.getRightRPM() * 10.0f);
+  float leftDeltaMM, rightDeltaMM;
+  uint16_t leftPos, rightPos;
+  motorControl.getEncoderPositions(leftPos, rightPos);
+  
+  // Format: [cmd, x1, y1, x2, y2, x3, y3, theta, lRPM, rRPM, lPos, rPos, crc] (24 bytes)
   response_buffer[0] = RESP_MOVE;
-  splitInt16(x_cm, response_buffer[1], response_buffer[2]);
-  splitInt16(y_cm, response_buffer[3], response_buffer[4]);
-  splitInt16(theta_scaled, response_buffer[5], response_buffer[6]);
-  response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
+  splitInt16(x1_cm, response_buffer[1], response_buffer[2]);
+  splitInt16(y1_cm, response_buffer[3], response_buffer[4]);
+  splitInt16(x2_cm, response_buffer[5], response_buffer[6]);
+  splitInt16(y2_cm, response_buffer[7], response_buffer[8]);
+  splitInt16(x3_cm, response_buffer[9], response_buffer[10]);
+  splitInt16(y3_cm, response_buffer[11], response_buffer[12]);
+  splitInt16(theta_scaled, response_buffer[13], response_buffer[14]);
+  splitInt16(leftRPM_scaled, response_buffer[15], response_buffer[16]);
+  splitInt16(rightRPM_scaled, response_buffer[17], response_buffer[18]);
+  response_buffer[19] = (leftPos >> 8) & 0xFF;
+  response_buffer[20] = leftPos & 0xFF;
+  response_buffer[21] = (rightPos >> 8) & 0xFF;
+  response_buffer[22] = rightPos & 0xFF;
+  response_buffer[23] = calculateCRC8Maxim(response_buffer, 23);
   
   response_ready = true;
 }
@@ -270,8 +294,8 @@ void prepareStatusResponse() {
   response_buffer[3] = 0x00; // Reserved (was motor temp)
   response_buffer[4] = 0x00; // Reserved (was motor temp)
   response_buffer[5] = fault_code;
-  response_buffer[6] = 0x00; // Reserved
-  response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
+  memset(&response_buffer[6], 0x00, 17); // Reserved
+  response_buffer[23] = calculateCRC8Maxim(response_buffer, 23);
   
   response_ready = true;
 }
@@ -279,12 +303,8 @@ void prepareStatusResponse() {
 void prepareCalibrateResponse() {
   response_buffer[0] = RESP_CALIBRATE;
   response_buffer[1] = calibration_status;
-  response_buffer[2] = 0x00; // Reserved
-  response_buffer[3] = 0x00; // Reserved
-  response_buffer[4] = 0x00; // Reserved
-  response_buffer[5] = 0x00; // Reserved
-  response_buffer[6] = 0x00; // Reserved
-  response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
+  memset(&response_buffer[2], 0x00, 21); // Reserved
+  response_buffer[23] = calculateCRC8Maxim(response_buffer, 23);
   
   response_ready = true;
 }
@@ -334,11 +354,11 @@ void receiveEvent(int numBytes) {
 // Function that executes when data is requested by master
 void requestEvent() {
   if (response_ready) {
-    Wire.write(response_buffer, 8);
+    Wire.write(response_buffer, 24);
     response_ready = false;
     
     Serial.print("Response sent: ");
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 24; i++) {
       Serial.print("0x");
       Serial.print(response_buffer[i], HEX);
       Serial.print(" ");
@@ -346,8 +366,8 @@ void requestEvent() {
     Serial.println();
   } else {
     // Send empty response if nothing ready
-    uint8_t empty_response[8] = {0};
-    Wire.write(empty_response, 8);
+    uint8_t empty_response[24] = {0};
+    Wire.write(empty_response, 24);
     Serial.println("Empty response sent");
   }
 }
@@ -389,10 +409,7 @@ void processCommand() {
     Serial.print(", Turn: ");
     Serial.println(turn);
     
-    // Execute motor command through MotorControl class
-    motorControl.executeCommand(speed, turn);
-    
-    // Prepare position response
+    // Prepare position response (command will be executed in main loop)
     preparePositionResponse();
     
   } else if (cmd_id == CMD_STATUS) {
@@ -435,8 +452,8 @@ void processCommand() {
         response_buffer[0] = RESP_RESET;
         response_buffer[1] = 0x00;        // 0 = not accepted / not started
         response_buffer[2] = RESET_NONE;  // No reset performed
-        memset(&response_buffer[3], 0x00, 4);
-        response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
+        memset(&response_buffer[3], 0x00, 20);
+        response_buffer[23] = calculateCRC8Maxim(response_buffer, 23);
         response_ready = true;
 
         return;
@@ -465,8 +482,8 @@ void processCommand() {
     response_buffer[0] = RESP_RESET;
     response_buffer[1] = reset_in_progress ? 0x01 : 0x00;
     response_buffer[2] = reset_target;
-    memset(&response_buffer[3], 0x00, 4); // Clear reserved bytes
-    response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
+    memset(&response_buffer[3], 0x00, 20); // Clear reserved bytes
+    response_buffer[23] = calculateCRC8Maxim(response_buffer, 23);
     response_ready = true;
     
   } else {

@@ -1,5 +1,5 @@
 #include "IMUControl.h"
-
+#define ICM_20948_USE_DMP
 // Static instance for SERCOM0 interrupt handling
 IMUControl* IMUControl::_instance = nullptr;
 

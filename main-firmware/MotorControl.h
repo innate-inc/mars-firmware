@@ -38,11 +38,14 @@ public:
   float getLeftRPM() const;
   float getRightRPM() const;
 
+  /** Get latest encoder deltas (mm, sign-corrected, snapshot - not cleared) */
+  void getEncoderPositions(uint16_t &leftPos, uint16_t &rightPos) const;
+
   /** Update position estimation based on motor speeds */
   void updatePosition(int16_t left_speed, int16_t right_speed);
 
-  /** Get current estimated position */
-  void getPosition(float &x, float &y, float &theta);
+  /** Get current estimated position (3 odom methods, shared theta) */
+  void getPosition(float &x1, float &y1, float &x2, float &y2, float &x3, float &y3, float &theta);
 
   /** Enable/disable IMU heading integration */
   void enableIMUHeading(bool enable = true);
@@ -74,11 +77,29 @@ private:
   bool _newLeftRPM;
   bool _newRightRPM;
   
-  // Position tracking (matching I2C implementation)
-  float _currentX;
-  float _currentY;
+  // Position tracking - 3 odometry methods with shared heading
+  // Method 1: commanded speed dead reckoning
+  float _odomX1;
+  float _odomY1;
+  // Method 2: encoder position feedback
+  float _odomX2;
+  float _odomY2;
+  // Method 3: commanded speed with averaged heading
+  float _odomX3;
+  float _odomY3;
   float _currentTheta;
+  float _prevTheta;
   unsigned long _lastUpdateTime;
+  
+  struct EncoderState {
+    uint16_t lastPos = 0;
+    bool initialized = false;
+    float deltaMM = 0.0f;
+  };
+
+  // Encoder position tracking for Method 2
+  EncoderState _leftEncoder;
+  EncoderState _rightEncoder;
   
   // IMU integration
   IMUControl* _imuControl;
@@ -104,7 +125,7 @@ private:
   void setMotorID(Stream &motorSerial);
   void setMotorMode(Stream &motorSerial);
   void sendMotorCommand(Stream &motorSerial, int16_t speed);
-  void processMotorFeedback(uint8_t* buffer, size_t& bufIndex, float& lastRPM, bool& newRPM);
+  void processMotorFeedback(Stream& serial, uint8_t* buffer, size_t& bufIndex, float& lastRPM, bool& newRPM, EncoderState& encoder, float sign);
   
   // Friend declarations for interrupt handlers
   friend void SERCOM4_0_Handler();

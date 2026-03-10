@@ -1,6 +1,6 @@
 #ifndef IMUCONTROL_H
 #define IMUCONTROL_H
-
+#define ICM_20948_USE_DMP
 #include <Arduino.h>
 #include <Wire.h>
 #include "wiring_private.h"

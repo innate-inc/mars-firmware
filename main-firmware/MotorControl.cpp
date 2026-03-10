@@ -12,8 +12,12 @@ MotorControl::MotorControl()
     _lastLeftSpeed(0), _lastRightSpeed(0),
     _lastLeftRPM(0.0f), _lastRightRPM(0.0f),
     _newLeftRPM(false), _newRightRPM(false),
-    _currentX(0.0f), _currentY(0.0f), _currentTheta(0.0f),
+    _odomX1(0.0f), _odomY1(0.0f),
+    _odomX2(0.0f), _odomY2(0.0f),
+    _odomX3(0.0f), _odomY3(0.0f),
+    _currentTheta(0.0f), _prevTheta(0.0f),
     _lastUpdateTime(0),
+    _leftEncoder(), _rightEncoder(),
     _leftBufIndex(0), _rightBufIndex(0),
     _imuControl(nullptr), _useIMUHeading(false)
 {
@@ -52,9 +56,13 @@ void MotorControl::begin(uint32_t baud) {
   delay(20);
 
   // Initialize position tracking
-  _currentX = 0.0f;
-  _currentY = 0.0f;
+  _odomX1 = 0.0f; _odomY1 = 0.0f;
+  _odomX2 = 0.0f; _odomY2 = 0.0f;
+  _odomX3 = 0.0f; _odomY3 = 0.0f;
   _currentTheta = 0.0f;
+  _prevTheta = 0.0f;
+  _leftEncoder = {};
+  _rightEncoder = {};
   _lastUpdateTime = millis();
 
   Serial.println("Motors initialized");
@@ -108,11 +116,8 @@ void MotorControl::sendMotorSpeeds(int16_t left_speed, int16_t right_speed) {
 }
 
 void MotorControl::processFeedback() {
-  // Process feedback from left motor
-  processMotorFeedback(_leftBuffer, _leftBufIndex, _lastLeftRPM, _newLeftRPM);
-  
-  // Process feedback from right motor  
-  processMotorFeedback(_rightBuffer, _rightBufIndex, _lastRightRPM, _newRightRPM);
+  processMotorFeedback(*_serialLeft, _leftBuffer, _leftBufIndex, _lastLeftRPM, _newLeftRPM, _leftEncoder, 1.0f);
+  processMotorFeedback(*_serialRight, _rightBuffer, _rightBufIndex, _lastRightRPM, _newRightRPM, _rightEncoder, -1.0f);
 }
 
 bool MotorControl::available() {
@@ -130,18 +135,34 @@ float MotorControl::getRightRPM() const {
   return _lastRightRPM;
 }
 
+void MotorControl::getEncoderPositions(uint16_t &leftPos, uint16_t &rightPos) const {
+  leftPos = _leftEncoder.lastPos;
+  rightPos = _rightEncoder.lastPos;
+}
+
 void MotorControl::updatePosition(int16_t left_speed, int16_t right_speed) {
   unsigned long current_time = millis();
   float dt = (current_time - _lastUpdateTime) / 1000.0f;
   
   if (_lastUpdateTime == 0) {
     _lastUpdateTime = current_time;
+    _prevTheta = _currentTheta;
+    _leftEncoder.deltaMM = 0.0f;
+    _rightEncoder.deltaMM = 0.0f;
     return;
   }
   
-  // Skip updates if dt is too small or too large (prevent wild jumps)
-  if (dt < 0.001f || dt > 0.1f) {
+  // Skip updates if dt is too small (let deltaMM keep accumulating)
+  if (dt < 0.001f) {
+    return;
+  }
+  
+  // Skip updates if dt is too large (prevent wild jumps, discard stale data)
+  if (dt > 0.1f) {
     _lastUpdateTime = current_time;
+    _prevTheta = _currentTheta;
+    _leftEncoder.deltaMM = 0.0f;
+    _rightEncoder.deltaMM = 0.0f;
     return;
   }
   
@@ -155,17 +176,42 @@ void MotorControl::updatePosition(int16_t left_speed, int16_t right_speed) {
   // Compute the average linear speed (forward/backward motion)
   float v = (vLeft + vRight) / 2.0;
   
-  // Compute angular velocity (turning motion)
-  float omega = (vRight - vLeft) / TRACK_WIDTH;
+  // Method 1: dead reckoning from commanded speeds
+  float v_m = v / 1000.0; // mm/s to m/s
+  _odomX1 += v_m * cos(_currentTheta) * dt;
+  _odomY1 += v_m * sin(_currentTheta) * dt;
+  
+  // Method 2: dead reckoning from feedback velocity
+  float vFbLeft = (_lastLeftRPM / 60.0) * wheelCircumference;   // RPM to mm/s
+  float vFbRight = (-_lastRightRPM / 60.0) * wheelCircumference; // negate (motor reversed)
+  float vFb_m = ((vFbLeft + vFbRight) / 2.0) / 1000.0; // mm/s to m/s
+  _odomX2 += vFb_m * cos(_currentTheta) * dt;
+  _odomY2 += vFb_m * sin(_currentTheta) * dt;
+  
+  // Encoder displacement for Method 3
+  float vEnc = (_leftEncoder.deltaMM + _rightEncoder.deltaMM) / 2.0f;
+  float vEnc_m = vEnc / 1000.0f; // mm to m
+  _leftEncoder.deltaMM = 0.0f;
+  _rightEncoder.deltaMM = 0.0f;
+  
+  // Method 3: encoder arc integration with averaged heading
+  float dTheta = _currentTheta - _prevTheta;
+  while (dTheta > PI) dTheta -= 2 * PI;
+  while (dTheta < -PI) dTheta += 2 * PI;
 
-  // Heading is now updated continuously in main loop via updateHeadingFromIMU()
-  // No need to update heading here since it's handled separately
+  float local_x = 0;
+  float local_y = 0;
+  if (fabs(dTheta) < 0.00001) {
+    local_x = vEnc_m;
+  } else {
+    float rw = vEnc_m/dTheta;
+    local_x = rw * sin(dTheta);
+    local_y = rw * (1-cos(dTheta));
+  }
+  _odomX3 += local_x * cos(_prevTheta) - local_y * sin(_prevTheta);
+  _odomY3 += local_x * sin(_prevTheta) + local_y * cos(_prevTheta);
   
-  // Update the robot's estimated position using the current heading (theta)
-  // Convert mm/s to m/s for position storage
-  _currentX += (v / 1000.0) * cos(_currentTheta) * dt;
-  _currentY += (v / 1000.0) * sin(_currentTheta) * dt;
-  
+  _prevTheta = _currentTheta;
   _lastUpdateTime = current_time;
   
   // Debug output (only print every 10th update to avoid spam)
@@ -190,9 +236,10 @@ void MotorControl::updatePosition(int16_t left_speed, int16_t right_speed) {
   }
 }
 
-void MotorControl::getPosition(float &x, float &y, float &theta) {
-  x = _currentX;
-  y = _currentY;
+void MotorControl::getPosition(float &x1, float &y1, float &x2, float &y2, float &x3, float &y3, float &theta) {
+  x1 = _odomX1; y1 = _odomY1;
+  x2 = _odomX2; y2 = _odomY2;
+  x3 = _odomX3; y3 = _odomY3;
   theta = _currentTheta;
 }
 
@@ -219,9 +266,13 @@ void MotorControl::updateHeadingFromIMU(float heading) {
 }
 
 void MotorControl::resetPosition() {
-  _currentX = 0.0f;
-  _currentY = 0.0f;
+  _odomX1 = 0.0f; _odomY1 = 0.0f;
+  _odomX2 = 0.0f; _odomY2 = 0.0f;
+  _odomX3 = 0.0f; _odomY3 = 0.0f;
   _currentTheta = 0.0f;
+  _prevTheta = 0.0f;
+  _leftEncoder = {};
+  _rightEncoder = {};
   _lastUpdateTime = millis();
   Serial.println("Position tracking reset");
 }
@@ -254,17 +305,16 @@ void MotorControl::setMotorMode(Stream &motorSerial) {
 }
 
 void MotorControl::sendMotorCommand(Stream &motorSerial, int16_t speed) {
-  uint8_t cmd[10] = {_motorId, 0x64, 0,0, 0,0, 0x01, 0,0, 0};
+  uint8_t cmd[10] = {_motorId, 0x64, 0,0, 0x01, 0x03, 0x01, 0,0, 0};
+  //                                      fb1=speed fb2=pos accel
   splitInt16(speed, cmd[2], cmd[3]);
   cmd[9] = calculateCRC(cmd, 9);
   motorSerial.write(cmd, 10);
 }
 
-void MotorControl::processMotorFeedback(uint8_t* buffer, size_t& bufIndex, float& lastRPM, bool& newRPM) {
-  Stream* serial = (buffer == _leftBuffer) ? _serialLeft : _serialRight;
-  
-  while (serial->available()) {
-    uint8_t b = serial->read();
+void MotorControl::processMotorFeedback(Stream& serial, uint8_t* buffer, size_t& bufIndex, float& lastRPM, bool& newRPM, EncoderState& encoder, float sign) {
+  while (serial.available()) {
+    uint8_t b = serial.read();
     buffer[bufIndex++] = b;
 
     if (bufIndex >= 10) {
@@ -272,12 +322,22 @@ void MotorControl::processMotorFeedback(uint8_t* buffer, size_t& bufIndex, float
         int16_t sp = combineInt16(buffer[2], buffer[3]);
         lastRPM = sp / 10.0f;
         newRPM = true;
+        
+        uint16_t pos = ((uint16_t)buffer[4] << 8) | buffer[5];
+        
+        if (encoder.initialized) {
+          int32_t delta = (int32_t)pos - (int32_t)encoder.lastPos;
+          if (delta > 32768) delta -= 65536;
+          if (delta < -32768) delta += 65536;
+          float wheelCirc = WHEEL_DIAMETER * 3.14159f;
+          encoder.deltaMM += sign * (delta / 65536.0f) * wheelCirc;
+        }
+        encoder.initialized = true;
+        encoder.lastPos = pos;
       }
-      // Slide buffer
       memmove(buffer, buffer + 1, --bufIndex);
     }
     
-    // Prevent buffer overflow
     if (bufIndex >= BUFFER_SIZE - 1) {
       bufIndex = 0;
     }
