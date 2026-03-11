@@ -89,8 +89,9 @@ void MotorControl::executeCommand(int16_t speed_cmd, int16_t turn_cmd) {
   int16_t right_speed = (int16_t)(rightRPM * 10);
   
   // Clamp the commands to the allowed motor range
-  left_speed = constrain(left_speed, -MAX_MOTOR_SPEED, MAX_MOTOR_SPEED);
-  right_speed = constrain(right_speed, -MAX_MOTOR_SPEED, MAX_MOTOR_SPEED);
+  float maxRatio = max(1, max(fabs(left_speed), fabs(right_speed)) / MAX_MOTOR_SPEED);
+  left_speed = left_speed / maxRatio;
+  right_speed = right_speed / maxRatio;
   
   // Send commands to motors
   sendMotorSpeeds(left_speed, -right_speed);
