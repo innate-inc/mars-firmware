@@ -76,6 +76,7 @@ uint8_t response_buffer[10];
 bool response_ready = false;
 int16_t latestSpeedCmd = 0;
 int16_t latestTurnCmd = 0;
+float turnP = 0.0f; // P gain for turn rate feedback
 
 // Reset Variables
 uint8_t reset_target = RESET_NONE;
@@ -225,6 +226,13 @@ float readBatteryVoltage() {
   float sourceV = pinV * dividerFactor;
 
   return sourceV;
+}
+
+int16_t correctTurnCmd(int16_t turncmd) {
+  float requested = turncmd / 100.0f;       // rad/s
+  float actual = imuControl.getGyroZ();      // rad/s
+  float corrected = (turnP * (requested - actual) + requested) * 100.0f;
+  return (int16_t)constrain(corrected, -32767, 32767);
 }
 
 // ---------------------------------------------------------------------
@@ -397,12 +405,19 @@ void processCommand() {
     Serial.println(turn);
     
     // Execute motor command through MotorControl class
-    motorControl.executeCommand(speed, turn);
+    motorControl.executeCommand(speed, correctTurnCmd(turn));
     
     // Prepare position response
     preparePositionResponse();
     
   } else if (cmd_id == CMD_STATUS) {
+    // Check if turnP is being set (bytes 1-2 as int16, scaled by 100)
+    int16_t turnP_scaled = combineInt16(i2c_buffer[1], i2c_buffer[2]);
+    if (turnP_scaled != INT16_MAX && turnP_scaled != INT16_MIN) {
+      turnP = turnP_scaled / 100.0f;
+      Serial.print("Turn P set to: ");
+      Serial.println(turnP, 2);
+    }
     Serial.println("Status request received");
     prepareStatusResponse();
     
@@ -544,7 +559,7 @@ void loop() {
   // Process any received I2C commands
   processCommand();
   
-  motorControl.executeCommand(latestSpeedCmd, latestTurnCmd);
+  motorControl.executeCommand(latestSpeedCmd, correctTurnCmd(latestTurnCmd));
   // Process motor feedback to get actual RPM data
   motorControl.processFeedback();
   
