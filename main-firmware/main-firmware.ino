@@ -231,8 +231,8 @@ float readBatteryVoltage() {
 // Prepare response functions
 void preparePositionResponse() {
   // Get current position from motor control
-  float x, y, theta;
-  motorControl.getPosition(x, y, theta);
+  float x, y, theta, odomTheta;
+  motorControl.getPosition(x, y, theta, odomTheta);
   
   // Convert position to fixed-point format for transmission (matching Jetson expectations)
   // Position is in meters, convert to cm for transmission (Jetson divides by 100)

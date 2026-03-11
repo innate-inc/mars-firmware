@@ -12,7 +12,7 @@ MotorControl::MotorControl()
     _lastLeftSpeed(0), _lastRightSpeed(0),
     _lastLeftRPM(0.0f), _lastRightRPM(0.0f),
     _newLeftRPM(false), _newRightRPM(false),
-    _currentX(0.0f), _currentY(0.0f), _currentTheta(0.0f),
+    _currentX(0.0f), _currentY(0.0f), _currentTheta(0.0f), _odomTheta(0.0f),
     _lastUpdateTime(0),
     _leftBufIndex(0), _rightBufIndex(0),
     _imuControl(nullptr), _useIMUHeading(false)
@@ -55,6 +55,7 @@ void MotorControl::begin(uint32_t baud) {
   _currentX = 0.0f;
   _currentY = 0.0f;
   _currentTheta = 0.0f;
+  _odomTheta = 0.0f;
   _lastUpdateTime = millis();
 
   Serial.println("Motors initialized");
@@ -154,6 +155,12 @@ void MotorControl::updatePosition(int16_t left_speed, int16_t right_speed) {
   // Compute the average linear speed (forward/backward motion)
   float v = (vFbLeft + vFbRight) / 2.0;
   
+  // Update odom theta from wheel differential
+  float omega = (vFbRight - vFbLeft) / TRACK_WIDTH;
+  _odomTheta += omega * dt;
+  while (_odomTheta > PI) _odomTheta -= 2 * PI;
+  while (_odomTheta < -PI) _odomTheta += 2 * PI;
+  
   // Update the robot's estimated position using the current heading (theta)
   // Convert mm/s to m/s for position storage
   _currentX += (v / 1000.0) * cos(_currentTheta) * dt;
@@ -183,10 +190,11 @@ void MotorControl::updatePosition(int16_t left_speed, int16_t right_speed) {
   }
 }
 
-void MotorControl::getPosition(float &x, float &y, float &theta) {
+void MotorControl::getPosition(float &x, float &y, float &theta, float &odomTheta) {
   x = _currentX;
   y = _currentY;
   theta = _currentTheta;
+  odomTheta = _odomTheta;
 }
 
 void MotorControl::enableIMUHeading(bool enable) {
@@ -215,6 +223,7 @@ void MotorControl::resetPosition() {
   _currentX = 0.0f;
   _currentY = 0.0f;
   _currentTheta = 0.0f;
+  _odomTheta = 0.0f;
   _lastUpdateTime = millis();
   Serial.println("Position tracking reset");
 }
