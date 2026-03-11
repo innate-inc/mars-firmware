@@ -72,7 +72,7 @@ BuzzerState buzzer_state = BUZZER_OFF;
 // I2C communication variables
 uint8_t i2c_buffer[8];
 bool command_ready = false;
-uint8_t response_buffer[8];
+uint8_t response_buffer[10];
 bool response_ready = false;
 int16_t latestSpeedCmd = 0;
 int16_t latestTurnCmd = 0;
@@ -201,8 +201,8 @@ void updateReset() {
       response_buffer[0] = RESP_RESET;
       response_buffer[1] = 0x02;        // Status: 0x02 = Completed
       response_buffer[2] = RESET_HSSW;  // Target that was reset
-      memset(&response_buffer[3], 0x00, 4); // Clear reserved bytes
-      response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
+      memset(&response_buffer[3], 0x00, 6); // Clear reserved bytes
+      response_buffer[9] = calculateCRC8Maxim(response_buffer, 9);
       response_ready = true;
       Serial.println("HSSW reset completion response prepared");
     }
@@ -239,6 +239,7 @@ void preparePositionResponse() {
   int16_t x_cm = (int16_t)(x * 100.0);  // Convert to cm
   int16_t y_cm = (int16_t)(y * 100.0);  // Convert to cm
   int16_t theta_scaled = (int16_t)(theta * 100.0); // Scale by 100 (hundredths of radian)
+  int16_t gyroZ_scaled = (int16_t)(imuControl.getGyroZ() * 100.0); // Gyro Z in hundredths of rad/s
   
   // Debug output
   Serial.print("Position - X: ");
@@ -249,11 +250,13 @@ void preparePositionResponse() {
   Serial.print(theta * 180.0 / PI, 1);
   Serial.println("°");
   
+  // Format: [cmd, x(2), y(2), theta(2), gyroZ(2), crc] = 10 bytes
   response_buffer[0] = RESP_MOVE;
   splitInt16(x_cm, response_buffer[1], response_buffer[2]);
   splitInt16(y_cm, response_buffer[3], response_buffer[4]);
   splitInt16(theta_scaled, response_buffer[5], response_buffer[6]);
-  response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
+  splitInt16(gyroZ_scaled, response_buffer[7], response_buffer[8]);
+  response_buffer[9] = calculateCRC8Maxim(response_buffer, 9);
   
   response_ready = true;
 }
@@ -271,7 +274,9 @@ void prepareStatusResponse() {
   response_buffer[4] = 0x00; // Reserved (was motor temp)
   response_buffer[5] = fault_code;
   response_buffer[6] = 0x00; // Reserved
-  response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
+  response_buffer[7] = 0x00; // Reserved
+  response_buffer[8] = 0x00; // Reserved
+  response_buffer[9] = calculateCRC8Maxim(response_buffer, 9);
   
   response_ready = true;
 }
@@ -284,7 +289,9 @@ void prepareCalibrateResponse() {
   response_buffer[4] = 0x00; // Reserved
   response_buffer[5] = 0x00; // Reserved
   response_buffer[6] = 0x00; // Reserved
-  response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
+  response_buffer[7] = 0x00; // Reserved
+  response_buffer[8] = 0x00; // Reserved
+  response_buffer[9] = calculateCRC8Maxim(response_buffer, 9);
   
   response_ready = true;
 }
@@ -334,11 +341,11 @@ void receiveEvent(int numBytes) {
 // Function that executes when data is requested by master
 void requestEvent() {
   if (response_ready) {
-    Wire.write(response_buffer, 8);
+    Wire.write(response_buffer, 10);
     response_ready = false;
     
     Serial.print("Response sent: ");
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 10; i++) {
       Serial.print("0x");
       Serial.print(response_buffer[i], HEX);
       Serial.print(" ");
@@ -346,8 +353,8 @@ void requestEvent() {
     Serial.println();
   } else {
     // Send empty response if nothing ready
-    uint8_t empty_response[8] = {0};
-    Wire.write(empty_response, 8);
+    uint8_t empty_response[10] = {0};
+    Wire.write(empty_response, 10);
     Serial.println("Empty response sent");
   }
 }
@@ -435,8 +442,8 @@ void processCommand() {
         response_buffer[0] = RESP_RESET;
         response_buffer[1] = 0x00;        // 0 = not accepted / not started
         response_buffer[2] = RESET_NONE;  // No reset performed
-        memset(&response_buffer[3], 0x00, 4);
-        response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
+        memset(&response_buffer[3], 0x00, 6);
+        response_buffer[9] = calculateCRC8Maxim(response_buffer, 9);
         response_ready = true;
 
         return;
@@ -465,8 +472,8 @@ void processCommand() {
     response_buffer[0] = RESP_RESET;
     response_buffer[1] = reset_in_progress ? 0x01 : 0x00;
     response_buffer[2] = reset_target;
-    memset(&response_buffer[3], 0x00, 4); // Clear reserved bytes
-    response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
+    memset(&response_buffer[3], 0x00, 6); // Clear reserved bytes
+    response_buffer[9] = calculateCRC8Maxim(response_buffer, 9);
     response_ready = true;
     
   } else {
