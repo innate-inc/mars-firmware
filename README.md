@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-This protocol defines the communication between the robot's main computer and its microcontroller over a UART interface. Each transmitted message now consists of:
+This document describes the **R6 protocol**, which defines communication between the robot's main computer and its microcontroller. The R6 protocol was originally designed for a UART interface; however, the current firmware implementation uses **I2C** as the physical transport (see `main-firmware.ino`). The message framing and payload structure described below still apply. Each transmitted message consists of:
 
 - **2 bytes for the Start-of-Message (SOM) marker:** Fixed value 0x69 0x69, which delineates the start of a new message.
 - **8 bytes of protocol message:** This includes 7 bytes of payload (ID and data fields) and 1 byte of CRC (calculated using CRC‑8/MAXIM over the payload bytes).
@@ -11,9 +11,11 @@ The overall physical message length is therefore **10 bytes**.
 
 ---
 
-## 2. Physical Layer (UART) Parameters
+## 2. Physical Layer Parameters (R6 Spec — UART)
 
-The UART interface should be configured as follows:
+> **Note:** The UART parameters below are part of the original R6 specification. The current firmware communicates over **I2C** (follower address `0x42`) instead of UART. The message structure and CRC scheme remain the same; only the transport layer differs.
+
+The R6 UART interface is configured as follows:
 
 - **Baud Rate:** 115200 baud
     
@@ -36,7 +38,7 @@ The UART interface should be configured as follows:
     (1 start bit, 8 data bits, and 1 stop bit per byte.)
     
 
-*Note:* The SOM marker and each subsequent byte are transmitted using these UART framing settings.
+*Note:* In the R6 UART spec, the SOM marker and each subsequent byte are transmitted using these framing settings. Over I2C the SOM marker is not used; the main computer writes the 8-byte payload directly to the follower address.
 
 ---
 
@@ -219,11 +221,13 @@ Responses are sent from the microcontroller back to the main computer. The conve
 
 ---
 
-## 6. Implementation and Synchronization
+## 6. Implementation and Synchronization (R6 / UART)
+
+> **Note:** The synchronization scheme below applies to the original R6 UART transport. The current I2C implementation does not use the SOM marker; message boundaries are handled by the I2C protocol itself.
 
 - **Message Reception:**
     
-    The receiver monitors the UART stream for the two-byte SOM marker (0x69 0x69). When this marker is detected, it begins buffering the next 8 bytes, which form the protocol message.
+    In the R6 UART mode, the receiver monitors the stream for the two-byte SOM marker (0x69 0x69). When this marker is detected, it begins buffering the next 8 bytes, which form the protocol message.
     
 - **CRC Verification:**
     
