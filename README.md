@@ -38,7 +38,7 @@ The R6 UART interface is configured as follows:
     (1 start bit, 8 data bits, and 1 stop bit per byte.)
     
 
-*Note:* In the R6 UART spec, the SOM marker and each subsequent byte are transmitted using these framing settings. Over I2C the SOM marker is not used; the main computer writes the 8-byte payload directly to the follower's register address.
+*Note:* In the R6 UART spec, the SOM marker and each subsequent byte are transmitted using these framing settings. Over I2C the SOM marker is not used; the main computer writes the 8-byte payload directly to the follower address.
 
 ---
 
