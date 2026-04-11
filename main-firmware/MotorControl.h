@@ -42,7 +42,7 @@ public:
   void updatePosition(int16_t left_speed, int16_t right_speed);
 
   /** Get current estimated position */
-  void getPosition(float &x, float &y, float &theta);
+  void getPosition(float &x, float &y, float &theta, float &odomTheta);
 
   /** Enable/disable IMU heading integration */
   void enableIMUHeading(bool enable = true);
@@ -78,6 +78,7 @@ private:
   float _currentX;
   float _currentY;
   float _currentTheta;
+  float _odomTheta;  // Heading from wheel odometry (differential drive)
   unsigned long _lastUpdateTime;
   
   // IMU integration

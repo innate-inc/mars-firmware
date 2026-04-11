@@ -34,6 +34,9 @@ public:
    */
   float getHeading() const;
 
+  /** Get gyro Z (yaw rate) in rad/s */
+  float getGyroZ() const;
+
   /**
    * Check if new heading data is available
    */
@@ -65,6 +68,7 @@ private:
   float _currentHeading;
   float _rawHeading;      // Raw IMU heading (no offset applied)
   float _headingOffset;   // Offset to make current heading = 0 at calibration
+  float _gyroZ;            // Yaw rate in rad/s from DMP raw gyro
   bool _newHeadingData;
   bool _initialized;
   
@@ -74,6 +78,9 @@ private:
   // Timing
   unsigned long _lastUpdateTime;
   static const unsigned long UPDATE_INTERVAL_MS = 10; // 100Hz update rate
+  int _loopCalls = 0;  // Counts every call to update() for loop Hz measurement
+  int _gyroFrameCount = 0;
+  int _quatFrameCount = 0;
   
   // Helper methods
   bool initializeCustomI2C();

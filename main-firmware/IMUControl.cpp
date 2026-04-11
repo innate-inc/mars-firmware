@@ -5,7 +5,7 @@ IMUControl* IMUControl::_instance = nullptr;
 
 IMUControl::IMUControl()
   : _customI2C(&sercom0, A4, A1), // A4 (SDA), A1 (SCL) using SERCOM0
-    _currentHeading(0.0f), _headingOffset(0.0f),
+    _currentHeading(0.0f), _headingOffset(0.0f), _gyroZ(0.0f),
     _newHeadingData(false), _initialized(false), _lastUpdateTime(0)
 {
   // Register this instance for SERCOM0 interrupt handling
@@ -47,23 +47,62 @@ bool IMUControl::begin() {
 void IMUControl::update() {
   if (!_initialized) return;
   
+  
   unsigned long currentTime = millis();
   if (currentTime - _lastUpdateTime < UPDATE_INTERVAL_MS) {
     return; // Not time for update yet
   }
+  _loopCalls++;
   
   _lastUpdateTime = currentTime;
   
-  // Read DMP data from FIFO
-  ICM_20948_Status_e status = _imu.readDMPdataFromFIFO(&_dmpData);
+  // Drain FIFO to get the freshest DMP data
+  int drainCount = 0;
+  ICM_20948_Status_e status;
+  do {
+    status = _imu.readDMPdataFromFIFO(&_dmpData);
+    if (status == ICM_20948_Stat_Ok || status == ICM_20948_Stat_FIFOMoreDataAvail) {
+      processQuaternionData();
+      drainCount++;
+    }
+  } while (status == ICM_20948_Stat_FIFOMoreDataAvail);
   
-  if (status == ICM_20948_Stat_Ok || status == ICM_20948_Stat_FIFOMoreDataAvail) {
-    processQuaternionData();
+  // Hz measurement: total frames from FIFO, polls with data, and loop speed
+  static unsigned long hzWindowStart = 0;
+  static int gyroFrames = 0;
+  static int quatFrames = 0;
+  static int pollsWithData = 0;
+  if (hzWindowStart == 0) hzWindowStart = currentTime;
+  gyroFrames += _gyroFrameCount;
+  quatFrames += _quatFrameCount;
+  _gyroFrameCount = 0;
+  _quatFrameCount = 0;
+  if (drainCount > 0) pollsWithData++;
+  unsigned long elapsed = currentTime - hzWindowStart;
+  if (elapsed >= 2000) {
+    float gyroHz = gyroFrames * 1000.0f / elapsed;
+    float quatHz = quatFrames * 1000.0f / elapsed;
+    float loopHz = _loopCalls * 1000.0f / elapsed;
+    Serial.print("Gyro Hz: ");
+    Serial.print(gyroHz, 1);
+    Serial.print("  Quat9 Hz: ");
+    Serial.print(quatHz, 1);
+    Serial.print("  Loop Hz: ");
+    Serial.println(loopHz, 1);
+    gyroFrames = 0;
+    quatFrames = 0;
+    pollsWithData = 0;
+    _loopCalls = 0;
+    hzWindowStart = currentTime;
   }
 }
 
 float IMUControl::getHeading() const {
   return _currentHeading;
+}
+
+float IMUControl::getGyroZ() const {
+  return _gyroZ;
 }
 
 bool IMUControl::headingAvailable() {
@@ -145,11 +184,25 @@ bool IMUControl::initializeIMU() {
 bool IMUControl::initializeDMP() {
   bool success = true; // Use success to show if the DMP configuration was successful
 
-  // Initialize the DMP
+  // Initialize the DMP (default uses divider=19 → 55Hz)
   success &= (_imu.initializeDMP() == ICM_20948_Stat_Ok);
+
+  // Override sample rate to 225Hz and fix gyro scale factor to match
+  ICM_20948_smplrt_t mySmplrt;
+  mySmplrt.g = 9; // 1125/(1+8) = 112Hz
+  mySmplrt.a = 17; // 1125/(1+17) = ~62Hz
+  success &= (_imu.setSampleRate((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), mySmplrt) == ICM_20948_Stat_Ok);
+  success &= (_imu.setGyroSF(8, 3) == ICM_20948_Stat_Ok); // divider=8, 2000dps
 
   // Enable the DMP Orientation sensor (9-axis quaternion for heading)
   success &= (_imu.enableDMPSensor(INV_ICM20948_SENSOR_ORIENTATION) == ICM_20948_Stat_Ok);
+
+  // Enable raw gyroscope for high-rate yaw rate
+  success &= (_imu.enableDMPSensor(INV_ICM20948_SENSOR_RAW_GYROSCOPE) == ICM_20948_Stat_Ok);
+
+  // Gyro at full DMP rate (112Hz), Quat9 at half rate (~56Hz)
+  success &= (_imu.setDMPODRrate(DMP_ODR_Reg_Gyro, 0) == ICM_20948_Stat_Ok);
+  success &= (_imu.setDMPODRrate(DMP_ODR_Reg_Quat9, 1) == ICM_20948_Stat_Ok);
 
   // Enable the FIFO 
   success &= (_imu.enableFIFO() == ICM_20948_Stat_Ok);
@@ -203,6 +256,7 @@ void IMUControl::processQuaternionData() {
     while (_currentHeading < -PI) _currentHeading += 2.0f * PI;
     
     _newHeadingData = true;
+    _quatFrameCount++;
     
     // Debug output
     static int debug_counter = 0;
@@ -216,6 +270,13 @@ void IMUControl::processQuaternionData() {
       Serial.print(_headingOffset * 180.0 / PI, 2);
       Serial.println("°)");
     }
+  }
+
+  // Process raw gyro data (arrives at full DMP rate)
+  if ((_dmpData.header & DMP_header_bitmap_Gyro) > 0) {
+    // 2000dps FSR: 1 LSB = 2000/32768 deg/s, convert to rad/s
+    _gyroZ = _dmpData.Raw_Gyro.Data.Z * (2000.0f / 32768.0f) * (PI / 180.0f);
+    _gyroFrameCount++;
   }
 }
 

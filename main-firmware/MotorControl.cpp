@@ -12,7 +12,7 @@ MotorControl::MotorControl()
     _lastLeftSpeed(0), _lastRightSpeed(0),
     _lastLeftRPM(0.0f), _lastRightRPM(0.0f),
     _newLeftRPM(false), _newRightRPM(false),
-    _currentX(0.0f), _currentY(0.0f), _currentTheta(0.0f),
+    _currentX(0.0f), _currentY(0.0f), _currentTheta(0.0f), _odomTheta(0.0f),
     _lastUpdateTime(0),
     _leftBufIndex(0), _rightBufIndex(0),
     _imuControl(nullptr), _useIMUHeading(false)
@@ -55,6 +55,7 @@ void MotorControl::begin(uint32_t baud) {
   _currentX = 0.0f;
   _currentY = 0.0f;
   _currentTheta = 0.0f;
+  _odomTheta = 0.0f;
   _lastUpdateTime = millis();
 
   Serial.println("Motors initialized");
@@ -88,8 +89,9 @@ void MotorControl::executeCommand(int16_t speed_cmd, int16_t turn_cmd) {
   int16_t right_speed = (int16_t)(rightRPM * 10);
   
   // Clamp the commands to the allowed motor range
-  left_speed = constrain(left_speed, -MAX_MOTOR_SPEED, MAX_MOTOR_SPEED);
-  right_speed = constrain(right_speed, -MAX_MOTOR_SPEED, MAX_MOTOR_SPEED);
+  float maxRatio = max(1, max(fabs(left_speed), fabs(right_speed)) / MAX_MOTOR_SPEED);
+  left_speed = left_speed / maxRatio;
+  right_speed = right_speed / maxRatio;
   
   // Send commands to motors
   sendMotorSpeeds(left_speed, -right_speed);
@@ -147,19 +149,18 @@ void MotorControl::updatePosition(int16_t left_speed, int16_t right_speed) {
   
   float wheelCircumference = WHEEL_DIAMETER * 3.14159;
   
-  // For position integration, use the actual motor speeds sent (not feedback)
-  // Convert motor speeds back to linear velocities
-  float vLeft = (left_speed / 10.0) / 60.0 * wheelCircumference;  // Convert RPM*10 to mm/s
-  float vRight = (right_speed / 10.0) / 60.0 * wheelCircumference;  // Convert RPM*10 to mm/s
+  // Use actual velocity reported back from the wheels (feedback RPM)
+  float vFbLeft = (_lastLeftRPM / 60.0) * wheelCircumference;   // RPM to mm/s
+  float vFbRight = (-_lastRightRPM / 60.0) * wheelCircumference; // negate (motor reversed)
   
   // Compute the average linear speed (forward/backward motion)
-  float v = (vLeft + vRight) / 2.0;
+  float v = (vFbLeft + vFbRight) / 2.0;
   
-  // Compute angular velocity (turning motion)
-  float omega = (vRight - vLeft) / TRACK_WIDTH;
-
-  // Heading is now updated continuously in main loop via updateHeadingFromIMU()
-  // No need to update heading here since it's handled separately
+  // Update odom theta from wheel differential
+  float omega = (vFbRight - vFbLeft) / TRACK_WIDTH;
+  _odomTheta += omega * dt;
+  while (_odomTheta > PI) _odomTheta -= 2 * PI;
+  while (_odomTheta < -PI) _odomTheta += 2 * PI;
   
   // Update the robot's estimated position using the current heading (theta)
   // Convert mm/s to m/s for position storage
@@ -190,10 +191,11 @@ void MotorControl::updatePosition(int16_t left_speed, int16_t right_speed) {
   }
 }
 
-void MotorControl::getPosition(float &x, float &y, float &theta) {
+void MotorControl::getPosition(float &x, float &y, float &theta, float &odomTheta) {
   x = _currentX;
   y = _currentY;
   theta = _currentTheta;
+  odomTheta = _odomTheta;
 }
 
 void MotorControl::enableIMUHeading(bool enable) {
@@ -222,6 +224,7 @@ void MotorControl::resetPosition() {
   _currentX = 0.0f;
   _currentY = 0.0f;
   _currentTheta = 0.0f;
+  _odomTheta = 0.0f;
   _lastUpdateTime = millis();
   Serial.println("Position tracking reset");
 }
@@ -254,7 +257,8 @@ void MotorControl::setMotorMode(Stream &motorSerial) {
 }
 
 void MotorControl::sendMotorCommand(Stream &motorSerial, int16_t speed) {
-  uint8_t cmd[10] = {_motorId, 0x64, 0,0, 0,0, 0x01, 0,0, 0};
+  uint8_t cmd[10] = {_motorId, 0x64, 0,0, 0x01, 0x00, 0x01, 0,0, 0};
+  //                                      fb1=speed       accel
   splitInt16(speed, cmd[2], cmd[3]);
   cmd[9] = calculateCRC(cmd, 9);
   motorSerial.write(cmd, 10);
