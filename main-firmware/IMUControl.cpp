@@ -7,6 +7,8 @@ IMUControl::IMUControl()
   : _customI2C(&sercom0, A4, A1), // A4 (SDA), A1 (SCL) using SERCOM0
     _currentHeading(0.0f), _headingOffset(0.0f),
     _newHeadingData(false), _initialized(false), _sleeping(false),
+    _motionWatch(false), _haveMotionBaseline(false), _lastAccelMag(0.0f),
+    _motionThresholdMg(0), _motionOverCount(0),
     _lastUpdateTime(0)
 {
   // Register this instance for SERCOM0 interrupt handling
@@ -46,7 +48,7 @@ bool IMUControl::begin() {
 }
 
 void IMUControl::update() {
-  if (!_initialized || _sleeping) return;
+  if (!_initialized || _sleeping || _motionWatch) return;
   
   unsigned long currentTime = millis();
   if (currentTime - _lastUpdateTime < UPDATE_INTERVAL_MS) {
@@ -85,25 +87,102 @@ void IMUControl::resetHeading() {
 }
 
 void IMUControl::setSleep(bool enable) {
-  if (!_initialized || enable == _sleeping) return;
+  if (!_initialized) return;
 
   if (enable) {
+    if (_sleeping) return; // Already in hardware sleep
+    // Hardware sleep supersedes motion-watch if we were in it. The DMP may
+    // have been disabled by motion-watch; resumeActive() re-enables it.
     _imu.sleep(true);
     _sleeping = true;
+    _motionWatch = false;
     Serial.println("IMU entering hardware sleep");
   } else {
-    _imu.sleep(false);
-    delay(30); // Let the sensor come out of sleep before touching the DMP
-
-    // Discard anything queued while asleep so the first heading after
-    // wake is fresh
-    _imu.resetDMP();
-    _imu.resetFIFO();
-    _newHeadingData = false;
-    _lastUpdateTime = millis();
-    _sleeping = false;
-    Serial.println("IMU woken from hardware sleep");
+    if (!_sleeping && !_motionWatch) return; // Already fully active
+    resumeActive();
   }
+}
+
+void IMUControl::resumeActive() {
+  _imu.sleep(false);       // No-op if not sleeping; clears the sleep bit
+  delay(30);               // Let the sensor settle before touching the DMP
+  _imu.enableDMP(true);    // Re-enable in case motion-watch disabled it
+
+  // Discard anything queued while asleep/watching so the first heading
+  // after resume is fresh
+  _imu.resetDMP();
+  _imu.resetFIFO();
+
+  _newHeadingData = false;
+  _sleeping = false;
+  _motionWatch = false;
+  _haveMotionBaseline = false;
+  _motionOverCount = 0;
+  _lastUpdateTime = millis();
+  Serial.println("IMU resumed to active");
+}
+
+void IMUControl::beginMotionWatch(uint16_t threshold_mg) {
+  if (!_initialized) return;
+
+  _motionThresholdMg = (threshold_mg == 0) ? 120 : threshold_mg;
+
+  if (_motionWatch) {
+    // Already watching - just re-arm the baseline/debounce
+    _haveMotionBaseline = false;
+    _motionOverCount = 0;
+    return;
+  }
+
+  // Coming from hardware sleep: wake the sensor front-end first
+  if (_sleeping) {
+    _imu.sleep(false);
+    delay(30);
+    _sleeping = false;
+  }
+
+  // Stop the DMP so the FIFO doesn't fill unattended; the accelerometer
+  // front-end keeps running and getAGMT() reads it directly.
+  _imu.enableDMP(false);
+
+  _motionWatch = true;
+  _haveMotionBaseline = false;
+  _motionOverCount = 0;
+
+  Serial.print("IMU motion-watch armed, threshold ");
+  Serial.print(_motionThresholdMg);
+  Serial.println(" mg");
+}
+
+bool IMUControl::pollMotion() {
+  if (!_motionWatch) return false;
+
+  // Refresh raw accel registers
+  if (_imu.getAGMT() != ICM_20948_Stat_Ok) return false;
+
+  float ax = _imu.accX();
+  float ay = _imu.accY();
+  float az = _imu.accZ();
+  float mag = sqrtf(ax * ax + ay * ay + az * az); // mg; ~1000 at rest
+
+  if (!_haveMotionBaseline) {
+    _lastAccelMag = mag;
+    _haveMotionBaseline = true;
+    return false;
+  }
+
+  float delta = fabsf(mag - _lastAccelMag);
+  _lastAccelMag = mag;
+
+  if (delta > (float)_motionThresholdMg) {
+    if (++_motionOverCount >= MOTION_CONFIRM_SAMPLES) {
+      _motionOverCount = 0;
+      return true;
+    }
+  } else {
+    _motionOverCount = 0;
+  }
+  return false;
 }
 
 bool IMUControl::isConnected() const {

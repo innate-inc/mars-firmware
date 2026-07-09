@@ -162,25 +162,36 @@ Commands are sent from the main computer to the microcontroller. The first byte 
 | 0–1 | **SOM** | 2 | `0x69 0x69` |
 | 2 | Cmd ID | 1 | `0x06` |
 | 3 | Power Mode | 1 | 0x00 = Active (wake), 0x01 = Sleep |
-| 4 | Sleep Flags | 1 | Bitfield, only used when entering sleep. Bit 0: gate the HSSW peripheral rail off for the duration of sleep. The HSSW rail powers the arm+head Dynamixels and the wheel motor drivers. |
-| 5–8 | Reserved | 4 | All `0x00` |
+| 4 | Sleep Flags | 1 | Bitfield, only used when entering sleep. See below. |
+| 5 | Motion Threshold | 1 | Only used with wake-on-motion. Detection threshold in 4 mg steps (value × 4 mg, range 4–1020 mg). 0 = firmware default (120 mg). |
+| 6–8 | Reserved | 3 | All `0x00` |
 | 9 | **CRC** | 1 | CRC-8/MAXIM over bytes 2–8 |
+
+**Sleep Flags (byte 4) bitfield:**
+
+| Bit | Name | Description |
+| --- | --- | --- |
+| 0 | Gate HSSW | Hold the HSSW peripheral rail off for the duration of sleep. The HSSW rail powers the arm+head Dynamixels and the wheel motor drivers. |
+| 1 | Wake on Motion | Keep the IMU accelerometer alive during sleep and watch for a physical disturbance (tap/nudge/pickup). |
+| 2 | Motion Auto-Wake | Have the MCU auto-exit sleep the instant motion is detected, rather than only latching the event for the main computer to act on. Requires bit 1. |
 
 **Sleep mode behavior:**
 
 - Motors receive a final zero-speed command, then all motor UART traffic stops.
-- The ICM-20948 IMU is put into hardware sleep (configuration retained).
 - The main loop drops from ~1 kHz to ~50 Hz.
 - I2C stays fully responsive; battery monitoring, the low-voltage buzzer, and the low-voltage cutoff keep running.
-- Movement commands (`0x01`) received during sleep are acknowledged with a position response but do **not** drive the motors. Waking is only done explicitly via this command with mode 0x00.
+- Movement commands (`0x01`) received during sleep are acknowledged with a position response but do **not** drive the motors. Waking is only done explicitly via this command with mode 0x00 (or by motion auto-wake, if enabled).
 - Calibration commands (`0x04`) received during sleep are refused with a Failure status.
-- If bit 0 of the Sleep Flags is set, the HSSW enable pin is held low for the whole sleep period (including through low-voltage recovery and reset cycles). This cuts power to the arm+head Dynamixels and the wheel motor drivers. The main computer must sequence around this: the Dynamixel bus is dead while gated (so any touch/boop wake detection based on servo polling stops working — only network/app wake remains) and its arm node should stop polling the bus. The EFUSE rail is never gated by sleep — it powers the main computer.
+- **IMU:** without the Wake-on-Motion flag, the ICM-20948 is put into full hardware sleep (configuration retained). With the flag, the accelerometer is kept running (DMP disabled) and sampled at the sleep-loop rate (~50 Hz). A frame-to-frame change in acceleration magnitude exceeding the threshold on two consecutive samples latches a "motion wake pending" event. The IMU sits on the MCU's own I2C bus (not the HSSW rail), so wake-on-motion keeps working even when the rail is gated — it is the physical wake path that gating would otherwise remove. Note that with the arm unpowered and limp, a gentle head-boop may not couple enough acceleration into the chassis; this is a "tap/nudge/pickup" wake, tunable via the threshold.
+- The latched motion event is reported to the main computer two ways: bit 1 of the Status response power/wake-flags byte (so the routine battery poll surfaces it) and byte 6 of the Power Mode response. It is re-armed (cleared) each time a sleep command is (re-)issued and on wake.
+- If bit 0 of the Sleep Flags is set, the HSSW enable pin is held low for the whole sleep period (including through low-voltage recovery and reset cycles). This cuts power to the arm+head Dynamixels and the wheel motor drivers. The main computer must sequence around this: the Dynamixel bus is dead while gated (so any touch/boop wake detection based on servo polling stops working — use wake-on-motion instead) and its arm node should stop polling the bus. The EFUSE rail is never gated by sleep — it powers the main computer.
 
 **Wake behavior:**
 
 - The HSSW rail is restored (unless the low-voltage cutoff is active).
 - If the rail was gated during sleep, the wheel motor drivers were power cycled: the firmware waits 200 ms for the rail to settle and then re-sends their ID/mode configuration. The arm+head Dynamixels also come back up at this point; re-initializing them is the main computer's job.
-- The IMU is woken and its DMP/FIFO reset so the first heading after wake is fresh.
+- The IMU is resumed to full active/DMP operation and its DMP/FIFO reset so the first heading after wake is fresh.
+- With Motion Auto-Wake enabled, the MCU performs this wake itself the instant motion is detected — the rail comes up and wheels re-init while the main computer is still noticing the latched bit, hiding the ~550 ms rail-settle + re-init latency.
 
 ---
 
@@ -233,7 +244,7 @@ Responses are sent from the microcontroller back to the main computer. The conve
     | 3–4 | Battery Voltage | 2 bytes | 16‑bit unsigned value representing battery voltage scaled by 100 (e.g., 12.34V → 1234). |
     | 5–6 | Motor Temperature | 2 bytes | 16‑bit value for motor temperature (units and scaling defined by the system). |
     | 7 | Fault Code | 1 byte | Fault code or bitfield indicating errors or warnings. |
-    | 8 | Power Mode | 1 byte | Current power mode: 0x00 = Active, 0x01 = Sleep. (Previously reserved.) |
+    | 8 | Power/Wake Flags | 1 byte | Bitfield (previously reserved). Bit 0: sleep mode active. Bit 1: motion wake pending (a physical disturbance was detected during sleep). |
     | 9 | **CRC** | 1 byte | CRC‑8/MAXIM computed over bytes 2–8. |
 
 ### 5.4. Calibration Response
@@ -265,7 +276,8 @@ Responses are sent from the microcontroller back to the main computer. The conve
 | 3 | Power Mode | 1 | Current mode: 0x00 = Active, 0x01 = Sleep |
 | 4 | Sleep Flags | 1 | Active sleep flags (0x00 when awake) |
 | 5 | Motors Reinit | 1 | 0x01 if the motor drivers were re-initialized on the last wake (rail was gated), else 0x00 |
-| 6–8 | Reserved | 3 | All `0x00` |
+| 6 | Motion Wake Pending | 1 | 0x01 if a physical disturbance was detected during sleep (was reserved), else 0x00 |
+| 7–8 | Reserved | 2 | All `0x00` |
 | 9 | **CRC** | 1 | CRC-8/MAXIM over bytes 2–8 |
 
 ---

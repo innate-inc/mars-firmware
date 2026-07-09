@@ -61,6 +61,21 @@
 // kills the Dynamixel bus (no boop-to-wake while gated) and the Jetson
 // must sequence its arm node around the power loss.
 #define SLEEP_FLAG_GATE_HSSW 0x01
+// Keep the IMU accelerometer alive during sleep and watch for a physical
+// disturbance (tap/nudge/pickup). The IMU sits on the MCU's own I2C bus,
+// not the HSSW rail, so this works even when the rail is gated - it is the
+// physical wake path that gating would otherwise remove.
+#define SLEEP_FLAG_WAKE_ON_MOTION 0x02
+// Additionally, have the MCU auto-exit sleep the instant motion latches
+// (restoring the rail / re-initializing wheels), instead of only reporting
+// the latched bit and waiting for the Jetson to command the wake. Requires
+// SLEEP_FLAG_WAKE_ON_MOTION.
+#define SLEEP_FLAG_MOTION_AUTOWAKE 0x04
+
+// Default motion-detection threshold (mg of frame-to-frame |accel| change)
+// used when CMD_POWER data byte 3 is 0. Tuned to ignore ambient vibration
+// but latch on a firm tap or a pickup.
+#define MOTION_THRESHOLD_DEFAULT_MG 120
 
 // ---------------------------------------------------------------------
 // Global objects
@@ -101,6 +116,7 @@ bool reset_in_progress = false;
 uint8_t power_mode = POWER_MODE_ACTIVE;
 uint8_t sleep_flags = 0x00;
 bool wake_motors_reinited = false; // Diagnostic: motors re-initialized on last wake
+bool motion_wake_pending = false;  // Latched when motion is detected during sleep
 #define SLEEP_LOOP_DELAY_MS 20     // Loop period while asleep (vs 1ms active)
 
 // True when sleep mode is intentionally holding the HSSW rail off.
@@ -247,14 +263,21 @@ void updateReset() {
 // Sleep quiesces everything the MCU drives while keeping the wake surface
 // alive: I2C stays fully responsive, battery monitoring and the low-voltage
 // buzzer/cutoff keep running. Motors get one final zero-speed command and
-// then no UART traffic at all; the ICM-20948 is put into its hardware sleep
-// state; the main loop drops from ~1kHz to ~50Hz. If the Jetson sets
-// SLEEP_FLAG_GATE_HSSW, the high-side-switched peripheral rail is held off
-// for the duration of sleep.
+// then no UART traffic at all; the main loop drops from ~1kHz to ~50Hz. If
+// the Jetson sets SLEEP_FLAG_GATE_HSSW, the high-side-switched peripheral
+// rail is held off for the duration of sleep.
+//
+// The IMU handling depends on SLEEP_FLAG_WAKE_ON_MOTION: without it the
+// ICM-20948 is put into full hardware sleep; with it the accelerometer is
+// kept alive (DMP off) and sampled in the sleep loop so a physical tap/nudge
+// can be detected. motion_threshold_mg is the per-sample |accel| delta that
+// counts as motion.
 
-void enterSleep(uint8_t flags) {
+void enterSleep(uint8_t flags, uint16_t motion_threshold_mg) {
   bool already_asleep = (power_mode == POWER_MODE_SLEEP);
   bool was_gated = hsswGatedBySleep();
+  bool want_motion = (flags & SLEEP_FLAG_WAKE_ON_MOTION);
+  bool was_motion = (sleep_flags & SLEEP_FLAG_WAKE_ON_MOTION);
 
   if (!already_asleep) {
     Serial.print("Entering sleep mode, flags: 0x");
@@ -269,12 +292,26 @@ void enterSleep(uint8_t flags) {
       delay(5);
     }
 
-    // Hardware sleep for the IMU (config is retained, DMP resumes on wake)
-    imuControl.setSleep(true);
+    // Put the IMU into the sub-mode this sleep needs
+    if (want_motion) {
+      imuControl.beginMotionWatch(motion_threshold_mg);
+    } else {
+      // Full hardware sleep (config retained, DMP resumes on wake)
+      imuControl.setSleep(true);
+    }
+  } else {
+    // Re-issued while already asleep (re-arm, or flags changed): keep the
+    // IMU sub-mode in sync with the new flags. Both calls are idempotent.
+    if (want_motion) {
+      imuControl.beginMotionWatch(motion_threshold_mg); // arms or re-arms
+    } else if (was_motion) {
+      imuControl.setSleep(true);                        // motion-watch -> hw sleep
+    }
   }
 
   power_mode = POWER_MODE_SLEEP;
   sleep_flags = flags;
+  motion_wake_pending = false; // (re)arm the latch on every sleep command
 
   // Apply (or update) rail gating. Never touch EFUSE here - it powers the
   // main computer.
@@ -313,7 +350,11 @@ void exitSleep() {
   // Drop any stale bytes that arrived while we weren't reading feedback
   motorControl.flushFeedback();
 
+  // Resume the IMU to full active/DMP operation (handles either the
+  // hardware-sleep or motion-watch sub-mode it was left in)
   imuControl.setSleep(false);
+
+  motion_wake_pending = false;
   Serial.println("Wake complete");
 }
 
@@ -322,7 +363,7 @@ void preparePowerResponse() {
   response_buffer[1] = power_mode;
   response_buffer[2] = sleep_flags;
   response_buffer[3] = wake_motors_reinited ? 0x01 : 0x00;
-  response_buffer[4] = 0x00; // Reserved
+  response_buffer[4] = motion_wake_pending ? 0x01 : 0x00;
   response_buffer[5] = 0x00; // Reserved
   response_buffer[6] = 0x00; // Reserved
   response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
@@ -387,7 +428,11 @@ void prepareStatusResponse() {
   response_buffer[3] = 0x00; // Reserved (was motor temp)
   response_buffer[4] = 0x00; // Reserved (was motor temp)
   response_buffer[5] = fault_code;
-  response_buffer[6] = power_mode; // Current power mode (was reserved)
+  // Power/wake flags (was reserved): bit0 = sleep mode active,
+  // bit1 = motion wake pending. Carried on the status response so the
+  // Jetson's existing battery poll also surfaces a physical-wake event.
+  response_buffer[6] = (power_mode == POWER_MODE_SLEEP ? 0x01 : 0x00) |
+                       (motion_wake_pending ? 0x02 : 0x00);
   response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
 
   response_ready = true;
@@ -608,14 +653,24 @@ void processCommand() {
   } else if (cmd_id == CMD_POWER) {
     uint8_t requested_mode = i2c_buffer[1];
     uint8_t requested_flags = i2c_buffer[2];
+    uint8_t threshold_code = i2c_buffer[3];
+
+    // Byte 3 sets the motion threshold in 4 mg steps (0 = use default).
+    // 4..1020 mg range covers a light tap through a firm shove.
+    uint16_t motion_threshold_mg =
+        (threshold_code == 0) ? MOTION_THRESHOLD_DEFAULT_MG
+                              : (uint16_t)threshold_code * 4;
 
     Serial.print("Power command - Mode: 0x");
     Serial.print(requested_mode, HEX);
     Serial.print(", Flags: 0x");
-    Serial.println(requested_flags, HEX);
+    Serial.print(requested_flags, HEX);
+    Serial.print(", Motion thresh: ");
+    Serial.print(motion_threshold_mg);
+    Serial.println(" mg");
 
     if (requested_mode == POWER_MODE_SLEEP) {
-      enterSleep(requested_flags);
+      enterSleep(requested_flags, motion_threshold_mg);
     } else if (requested_mode == POWER_MODE_ACTIVE) {
       exitSleep();
     } else {
@@ -696,8 +751,25 @@ void loop() {
   updateReset();
 
   if (power_mode == POWER_MODE_SLEEP) {
-    // Low-power path: no motor UART traffic, no IMU polling. I2C stays
-    // responsive (interrupt driven), battery/buzzer/cutoff stay active.
+    // Low-power path: no motor UART traffic. I2C stays responsive
+    // (interrupt driven), battery/buzzer/cutoff stay active.
+    //
+    // If wake-on-motion is armed, sample the accelerometer this pass. On a
+    // confirmed disturbance, latch the bit (reported to the Jetson via the
+    // status/power responses) and, if AUTOWAKE is set, exit sleep now so the
+    // rail comes up while the Jetson is still noticing.
+    if (sleep_flags & SLEEP_FLAG_WAKE_ON_MOTION) {
+      if (imuControl.pollMotion()) {
+        if (!motion_wake_pending) {
+          Serial.println("Motion detected during sleep");
+        }
+        motion_wake_pending = true;
+        if (sleep_flags & SLEEP_FLAG_MOTION_AUTOWAKE) {
+          exitSleep();
+        }
+      }
+    }
+
     delay(SLEEP_LOOP_DELAY_MS);
     return;
   }
