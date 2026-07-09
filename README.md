@@ -162,7 +162,7 @@ Commands are sent from the main computer to the microcontroller. The first byte 
 | 0–1 | **SOM** | 2 | `0x69 0x69` |
 | 2 | Cmd ID | 1 | `0x06` |
 | 3 | Power Mode | 1 | 0x00 = Active (wake), 0x01 = Sleep |
-| 4 | Sleep Flags | 1 | Bitfield, only used when entering sleep. Bit 0: gate the HSSW peripheral rail off for the duration of sleep. |
+| 4 | Sleep Flags | 1 | Bitfield, only used when entering sleep. Bit 0: gate the HSSW peripheral rail off for the duration of sleep. The HSSW rail powers the arm+head Dynamixels and the wheel motor drivers. |
 | 5–8 | Reserved | 4 | All `0x00` |
 | 9 | **CRC** | 1 | CRC-8/MAXIM over bytes 2–8 |
 
@@ -174,12 +174,12 @@ Commands are sent from the main computer to the microcontroller. The first byte 
 - I2C stays fully responsive; battery monitoring, the low-voltage buzzer, and the low-voltage cutoff keep running.
 - Movement commands (`0x01`) received during sleep are acknowledged with a position response but do **not** drive the motors. Waking is only done explicitly via this command with mode 0x00.
 - Calibration commands (`0x04`) received during sleep are refused with a Failure status.
-- If bit 0 of the Sleep Flags is set, the HSSW enable pin is held low for the whole sleep period (including through low-voltage recovery and reset cycles). The EFUSE rail is never gated by sleep — it powers the main computer.
+- If bit 0 of the Sleep Flags is set, the HSSW enable pin is held low for the whole sleep period (including through low-voltage recovery and reset cycles). This cuts power to the arm+head Dynamixels and the wheel motor drivers. The main computer must sequence around this: the Dynamixel bus is dead while gated (so any touch/boop wake detection based on servo polling stops working — only network/app wake remains) and its arm node should stop polling the bus. The EFUSE rail is never gated by sleep — it powers the main computer.
 
 **Wake behavior:**
 
 - The HSSW rail is restored (unless the low-voltage cutoff is active).
-- If the rail was gated during sleep, the firmware waits 200 ms for the rail to settle and then re-sends motor ID/mode configuration in case the motor drivers were power cycled.
+- If the rail was gated during sleep, the wheel motor drivers were power cycled: the firmware waits 200 ms for the rail to settle and then re-sends their ID/mode configuration. The arm+head Dynamixels also come back up at this point; re-initializing them is the main computer's job.
 - The IMU is woken and its DMP/FIFO reset so the first heading after wake is fresh.
 
 ---

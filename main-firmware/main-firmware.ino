@@ -56,8 +56,10 @@
 #define POWER_MODE_SLEEP 0x01
 
 // Sleep option flags (CMD_POWER data byte 2)
-// HSSW gating is opt-in from the Jetson because it is not yet confirmed
-// which peripherals share the high-side-switched rail.
+// The HSSW rail powers the arm+head Dynamixels and the wheel motor
+// drivers. Gating is opt-in from the Jetson because cutting the rail
+// kills the Dynamixel bus (no boop-to-wake while gated) and the Jetson
+// must sequence its arm node around the power loss.
 #define SLEEP_FLAG_GATE_HSSW 0x01
 
 // ---------------------------------------------------------------------
@@ -298,9 +300,9 @@ void exitSleep() {
   if (!cutoff_triggered) {
     digitalWrite(HSSW_EN_PIN, HIGH);
     if (rail_was_gated) {
-      // Give the rail time to come up, then re-initialize the motor
-      // drivers in case they were on the gated rail and lost their
-      // ID/mode configuration.
+      // The wheel motor drivers are on the gated rail, so they were
+      // power cycled and lost their ID/mode configuration. Give the
+      // rail time to come up, then reconfigure them.
       delay(200);
       motorControl.reinit();
       wake_motors_reinited = true;
