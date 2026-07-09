@@ -276,8 +276,11 @@ void updateReset() {
 void enterSleep(uint8_t flags, uint16_t motion_threshold_mg) {
   bool already_asleep = (power_mode == POWER_MODE_SLEEP);
   bool was_gated = hsswGatedBySleep();
-  bool want_motion = (flags & SLEEP_FLAG_WAKE_ON_MOTION);
-  bool was_motion = (sleep_flags & SLEEP_FLAG_WAKE_ON_MOTION);
+
+  // Auto-wake is meaningless without motion detection
+  if (!(flags & SLEEP_FLAG_WAKE_ON_MOTION)) {
+    flags &= ~SLEEP_FLAG_MOTION_AUTOWAKE;
+  }
 
   if (!already_asleep) {
     Serial.print("Entering sleep mode, flags: 0x");
@@ -291,27 +294,28 @@ void enterSleep(uint8_t flags, uint16_t motion_threshold_mg) {
       motorControl.sendMotorSpeeds(0, 0);
       delay(5);
     }
+  }
 
-    // Put the IMU into the sub-mode this sleep needs
-    if (want_motion) {
-      imuControl.beginMotionWatch(motion_threshold_mg);
-    } else {
-      // Full hardware sleep (config retained, DMP resumes on wake)
-      imuControl.setSleep(true);
+  // Put the IMU into the sub-mode this sleep needs. Both calls are
+  // idempotent, so a re-issued sleep command re-arms motion watch (or
+  // handles a flags change between motion-watch and hardware sleep).
+  if (flags & SLEEP_FLAG_WAKE_ON_MOTION) {
+    if (!imuControl.beginMotionWatch(motion_threshold_mg)) {
+      // IMU never initialized - no motion wake is possible. Clear the
+      // motion bits so the reported flags describe what is actually armed
+      // and the Jetson doesn't rely on a wake path that doesn't exist.
+      flags &= ~(SLEEP_FLAG_WAKE_ON_MOTION | SLEEP_FLAG_MOTION_AUTOWAKE);
+      Serial.println("Motion watch unavailable (IMU not initialized) - motion flags cleared");
     }
   } else {
-    // Re-issued while already asleep (re-arm, or flags changed): keep the
-    // IMU sub-mode in sync with the new flags. Both calls are idempotent.
-    if (want_motion) {
-      imuControl.beginMotionWatch(motion_threshold_mg); // arms or re-arms
-    } else if (was_motion) {
-      imuControl.setSleep(true);                        // motion-watch -> hw sleep
-    }
+    // Full hardware sleep (config retained; DMP resumes on wake). No-op
+    // if already in hardware sleep or the IMU never initialized.
+    imuControl.setSleep(true);
   }
 
   power_mode = POWER_MODE_SLEEP;
   sleep_flags = flags;
-  motion_wake_pending = false; // (re)arm the latch on every sleep command
+  motion_wake_pending = false; // (Re)arm the latch on every sleep command
 
   // Apply (or update) rail gating. Never touch EFUSE here - it powers the
   // main computer.
@@ -354,7 +358,11 @@ void exitSleep() {
   // hardware-sleep or motion-watch sub-mode it was left in)
   imuControl.setSleep(false);
 
-  motion_wake_pending = false;
+  // Deliberately NOT cleared here: a motion auto-wake reaches this via
+  // exitSleep() and the latch must survive so the Jetson can see why the
+  // robot woke. The latch clears on the next explicit CMD_POWER (a sleep
+  // command re-arms it; an active command acknowledges it).
+  // motion_wake_pending stays as-is.
   Serial.println("Wake complete");
 }
 
@@ -673,6 +681,10 @@ void processCommand() {
       enterSleep(requested_flags, motion_threshold_mg);
     } else if (requested_mode == POWER_MODE_ACTIVE) {
       exitSleep();
+      // Explicit active command acknowledges (clears) any latched motion
+      // event - including after an auto-wake, where exitSleep() itself is
+      // a no-op because the MCU already woke.
+      motion_wake_pending = false;
     } else {
       Serial.println("Unknown power mode - reporting current state");
     }

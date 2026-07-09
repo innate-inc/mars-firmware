@@ -122,8 +122,8 @@ void IMUControl::resumeActive() {
   Serial.println("IMU resumed to active");
 }
 
-void IMUControl::beginMotionWatch(uint16_t threshold_mg) {
-  if (!_initialized) return;
+bool IMUControl::beginMotionWatch(uint16_t threshold_mg) {
+  if (!_initialized) return false; // No IMU - motion wake is not possible
 
   _motionThresholdMg = (threshold_mg == 0) ? 120 : threshold_mg;
 
@@ -131,7 +131,7 @@ void IMUControl::beginMotionWatch(uint16_t threshold_mg) {
     // Already watching - just re-arm the baseline/debounce
     _haveMotionBaseline = false;
     _motionOverCount = 0;
-    return;
+    return true;
   }
 
   // Coming from hardware sleep: wake the sensor front-end first
@@ -152,13 +152,17 @@ void IMUControl::beginMotionWatch(uint16_t threshold_mg) {
   Serial.print("IMU motion-watch armed, threshold ");
   Serial.print(_motionThresholdMg);
   Serial.println(" mg");
+  return true;
 }
 
 bool IMUControl::pollMotion() {
   if (!_motionWatch) return false;
 
-  // Refresh raw accel registers
-  if (_imu.getAGMT() != ICM_20948_Stat_Ok) return false;
+  // Refresh raw accel registers. getAGMT() returns the sample struct; the
+  // I2C transaction result is stored in _imu.status (same pattern as
+  // initializeIMU()).
+  _imu.getAGMT();
+  if (_imu.status != ICM_20948_Stat_Ok) return false;
 
   float ax = _imu.accX();
   float ay = _imu.accY();

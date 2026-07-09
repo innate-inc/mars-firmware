@@ -68,8 +68,10 @@ public:
    *
    * @param threshold_mg Per-sample |accel| change (in mg) that counts as
    *                     motion.
+   * @return true if motion-watch is armed; false if the IMU never
+   *         initialized (caller must not advertise a motion wake path).
    */
-  void beginMotionWatch(uint16_t threshold_mg);
+  bool beginMotionWatch(uint16_t threshold_mg);
 
   /**
    * Sample the accelerometer once and report whether motion is confirmed.

@@ -173,7 +173,9 @@ Commands are sent from the main computer to the microcontroller. The first byte 
 | --- | --- | --- |
 | 0 | Gate HSSW | Hold the HSSW peripheral rail off for the duration of sleep. The HSSW rail powers the arm+head Dynamixels and the wheel motor drivers. |
 | 1 | Wake on Motion | Keep the IMU accelerometer alive during sleep and watch for a physical disturbance (tap/nudge/pickup). |
-| 2 | Motion Auto-Wake | Have the MCU auto-exit sleep the instant motion is detected, rather than only latching the event for the main computer to act on. Requires bit 1. |
+| 2 | Motion Auto-Wake | Have the MCU auto-exit sleep the instant motion is detected, rather than only latching the event for the main computer to act on. Requires bit 1 (ignored and cleared without it). |
+
+The Sleep Flags reported back (in the Power Mode response and while asleep) are the **effective** flags: bit 2 is cleared if bit 1 was not set, and bits 1–2 are cleared if the IMU failed to initialize at boot (no motion wake is possible — the main computer must not rely on a physical wake path that does not exist).
 
 **Sleep mode behavior:**
 
@@ -183,7 +185,7 @@ Commands are sent from the main computer to the microcontroller. The first byte 
 - Movement commands (`0x01`) received during sleep are acknowledged with a position response but do **not** drive the motors. Waking is only done explicitly via this command with mode 0x00 (or by motion auto-wake, if enabled).
 - Calibration commands (`0x04`) received during sleep are refused with a Failure status.
 - **IMU:** without the Wake-on-Motion flag, the ICM-20948 is put into full hardware sleep (configuration retained). With the flag, the accelerometer is kept running (DMP disabled) and sampled at the sleep-loop rate (~50 Hz). A frame-to-frame change in acceleration magnitude exceeding the threshold on two consecutive samples latches a "motion wake pending" event. The IMU sits on the MCU's own I2C bus (not the HSSW rail), so wake-on-motion keeps working even when the rail is gated — it is the physical wake path that gating would otherwise remove. Note that with the arm unpowered and limp, a gentle head-boop may not couple enough acceleration into the chassis; this is a "tap/nudge/pickup" wake, tunable via the threshold.
-- The latched motion event is reported to the main computer two ways: bit 1 of the Status response power/wake-flags byte (so the routine battery poll surfaces it) and byte 6 of the Power Mode response. It is re-armed (cleared) each time a sleep command is (re-)issued and on wake.
+- The latched motion event is reported to the main computer two ways: bit 1 of the Status response power/wake-flags byte (so the routine battery poll surfaces it) and byte 6 of the Power Mode response. The latch is cleared by every Power Mode command — a sleep command re-arms it, an active command acknowledges it — and it deliberately **survives a motion auto-wake**, so after an auto-wake the status poll shows "active + motion wake pending" and the main computer can see why the robot woke. The Power Mode response always reflects the post-command state (an active command's response therefore reports the latch already cleared).
 - If bit 0 of the Sleep Flags is set, the HSSW enable pin is held low for the whole sleep period (including through low-voltage recovery and reset cycles). This cuts power to the arm+head Dynamixels and the wheel motor drivers. The main computer must sequence around this: the Dynamixel bus is dead while gated (so any touch/boop wake detection based on servo polling stops working — use wake-on-motion instead) and its arm node should stop polling the bus. The EFUSE rail is never gated by sleep — it powers the main computer.
 
 **Wake behavior:**
@@ -191,7 +193,7 @@ Commands are sent from the main computer to the microcontroller. The first byte 
 - The HSSW rail is restored (unless the low-voltage cutoff is active).
 - If the rail was gated during sleep, the wheel motor drivers were power cycled: the firmware waits 200 ms for the rail to settle and then re-sends their ID/mode configuration. The arm+head Dynamixels also come back up at this point; re-initializing them is the main computer's job.
 - The IMU is resumed to full active/DMP operation and its DMP/FIFO reset so the first heading after wake is fresh.
-- With Motion Auto-Wake enabled, the MCU performs this wake itself the instant motion is detected — the rail comes up and wheels re-init while the main computer is still noticing the latched bit, hiding the ~550 ms rail-settle + re-init latency.
+- With Motion Auto-Wake enabled, the MCU performs this wake itself the instant motion is detected — the rail comes up and wheels re-init while the main computer is still noticing the latched bit, hiding the ~550 ms rail-settle + re-init latency. The motion-wake-pending latch survives the auto-wake and is cleared when the main computer acknowledges with an active-mode Power command (or re-arms with a new sleep command).
 
 ---
 
