@@ -6,7 +6,8 @@ IMUControl* IMUControl::_instance = nullptr;
 IMUControl::IMUControl()
   : _customI2C(&sercom0, A4, A1), // A4 (SDA), A1 (SCL) using SERCOM0
     _currentHeading(0.0f), _headingOffset(0.0f),
-    _newHeadingData(false), _initialized(false), _lastUpdateTime(0)
+    _newHeadingData(false), _initialized(false), _sleeping(false),
+    _lastUpdateTime(0)
 {
   // Register this instance for SERCOM0 interrupt handling
   _instance = this;
@@ -45,7 +46,7 @@ bool IMUControl::begin() {
 }
 
 void IMUControl::update() {
-  if (!_initialized) return;
+  if (!_initialized || _sleeping) return;
   
   unsigned long currentTime = millis();
   if (currentTime - _lastUpdateTime < UPDATE_INTERVAL_MS) {
@@ -81,6 +82,28 @@ void IMUControl::resetHeading() {
   Serial.print("°, Offset: ");
   Serial.print(_headingOffset * 180.0 / PI, 2);
   Serial.println("°");
+}
+
+void IMUControl::setSleep(bool enable) {
+  if (!_initialized || enable == _sleeping) return;
+
+  if (enable) {
+    _imu.sleep(true);
+    _sleeping = true;
+    Serial.println("IMU entering hardware sleep");
+  } else {
+    _imu.sleep(false);
+    delay(30); // Let the sensor come out of sleep before touching the DMP
+
+    // Discard anything queued while asleep so the first heading after
+    // wake is fresh
+    _imu.resetDMP();
+    _imu.resetFIFO();
+    _newHeadingData = false;
+    _lastUpdateTime = millis();
+    _sleeping = false;
+    Serial.println("IMU woken from hardware sleep");
+  }
 }
 
 bool IMUControl::isConnected() const {

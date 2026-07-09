@@ -20,12 +20,14 @@
 #define CMD_STATUS 0x03
 #define CMD_CALIBRATE 0x04
 #define CMD_RESET 0x05
+#define CMD_POWER 0x06
 
 // Response definitions (MCU → Jetson)
 #define RESP_MOVE 0x81      // Position feedback
 #define RESP_STATUS 0x83    // Health data
 #define RESP_CALIBRATE 0x84 // Calibration status
 #define RESP_RESET 0x85     // Component Reset
+#define RESP_POWER 0x86     // Power mode status
 
 // ---------------------------------------------------------------------
 // Battery monitoring constants (matching reference implementation)
@@ -46,6 +48,17 @@
 #define RESET_HSSW 0x01
 #define RESET_EFUSE 0x02
 #define RESET_BOTH 0x03
+
+// Power modes (CMD_POWER data byte 1)
+// EFUSE_EN is never gated during sleep: it powers the main computer,
+// and cutting it would hard-restart the whole system.
+#define POWER_MODE_ACTIVE 0x00
+#define POWER_MODE_SLEEP 0x01
+
+// Sleep option flags (CMD_POWER data byte 2)
+// HSSW gating is opt-in from the Jetson because it is not yet confirmed
+// which peripherals share the high-side-switched rail.
+#define SLEEP_FLAG_GATE_HSSW 0x01
 
 // ---------------------------------------------------------------------
 // Global objects
@@ -82,6 +95,19 @@ uint8_t reset_target = RESET_NONE;
 unsigned long reset_start_time = 0;
 bool reset_in_progress = false;
 
+// Power management variables
+uint8_t power_mode = POWER_MODE_ACTIVE;
+uint8_t sleep_flags = 0x00;
+bool wake_motors_reinited = false; // Diagnostic: motors re-initialized on last wake
+#define SLEEP_LOOP_DELAY_MS 20     // Loop period while asleep (vs 1ms active)
+
+// True when sleep mode is intentionally holding the HSSW rail off.
+// Every place that re-asserts HSSW_EN must consult this, otherwise the
+// battery-recovery path turns the rail back on within one loop pass.
+bool hsswGatedBySleep() {
+  return power_mode == POWER_MODE_SLEEP && (sleep_flags & SLEEP_FLAG_GATE_HSSW);
+}
+
 // ---------------------------------------------------------------------
 // Low voltage buzzer management
 void updateBuzzer() {
@@ -91,7 +117,7 @@ void updateBuzzer() {
     cutoff_triggered = false;
     // Voltage recovered - turn off buzzer and reset state
     digitalWrite(BUZZER_PIN, LOW);
-    digitalWrite(HSSW_EN_PIN, HIGH);
+    digitalWrite(HSSW_EN_PIN, hsswGatedBySleep() ? LOW : HIGH);
     digitalWrite(EFUSE_EN_PIN, HIGH);
     buzzer_state = BUZZER_OFF;
     buzz_count = 0;
@@ -187,7 +213,7 @@ void updateReset() {
   if (millis() - reset_start_time >= 1000) {
     // Restore the enable pins
     if (reset_target & RESET_HSSW) {
-      digitalWrite(HSSW_EN_PIN, HIGH);
+      digitalWrite(HSSW_EN_PIN, hsswGatedBySleep() ? LOW : HIGH);
       Serial.println("HSSW restored");
     }
     if (reset_target & RESET_EFUSE) {
@@ -211,6 +237,95 @@ void updateReset() {
     reset_target = RESET_NONE;
     Serial.println("Reset complete");
   }
+}
+
+// ---------------------------------------------------------------------
+// Sleep / low-power mode
+//
+// Sleep quiesces everything the MCU drives while keeping the wake surface
+// alive: I2C stays fully responsive, battery monitoring and the low-voltage
+// buzzer/cutoff keep running. Motors get one final zero-speed command and
+// then no UART traffic at all; the ICM-20948 is put into its hardware sleep
+// state; the main loop drops from ~1kHz to ~50Hz. If the Jetson sets
+// SLEEP_FLAG_GATE_HSSW, the high-side-switched peripheral rail is held off
+// for the duration of sleep.
+
+void enterSleep(uint8_t flags) {
+  bool already_asleep = (power_mode == POWER_MODE_SLEEP);
+  bool was_gated = hsswGatedBySleep();
+
+  if (!already_asleep) {
+    Serial.print("Entering sleep mode, flags: 0x");
+    Serial.println(flags, HEX);
+
+    // Stop the base and stop commanding the motor drivers. Send the zero
+    // command a few times since the motor UART has no ack.
+    latestSpeedCmd = 0;
+    latestTurnCmd = 0;
+    for (int i = 0; i < 3; i++) {
+      motorControl.sendMotorSpeeds(0, 0);
+      delay(5);
+    }
+
+    // Hardware sleep for the IMU (config is retained, DMP resumes on wake)
+    imuControl.setSleep(true);
+  }
+
+  power_mode = POWER_MODE_SLEEP;
+  sleep_flags = flags;
+
+  // Apply (or update) rail gating. Never touch EFUSE here - it powers the
+  // main computer.
+  if (hsswGatedBySleep()) {
+    digitalWrite(HSSW_EN_PIN, LOW);
+    if (!was_gated) Serial.println("HSSW rail gated off for sleep");
+  } else if (was_gated && !cutoff_triggered) {
+    // Flags changed from gated to ungated while staying asleep
+    digitalWrite(HSSW_EN_PIN, HIGH);
+    Serial.println("HSSW rail restored (sleep continues)");
+  }
+}
+
+void exitSleep() {
+  if (power_mode == POWER_MODE_ACTIVE) return;
+
+  Serial.println("Waking from sleep mode");
+  bool rail_was_gated = hsswGatedBySleep();
+  power_mode = POWER_MODE_ACTIVE;
+  sleep_flags = 0x00;
+  wake_motors_reinited = false;
+
+  if (!cutoff_triggered) {
+    digitalWrite(HSSW_EN_PIN, HIGH);
+    if (rail_was_gated) {
+      // Give the rail time to come up, then re-initialize the motor
+      // drivers in case they were on the gated rail and lost their
+      // ID/mode configuration.
+      delay(200);
+      motorControl.reinit();
+      wake_motors_reinited = true;
+      Serial.println("HSSW rail restored, motors re-initialized");
+    }
+  }
+
+  // Drop any stale bytes that arrived while we weren't reading feedback
+  motorControl.flushFeedback();
+
+  imuControl.setSleep(false);
+  Serial.println("Wake complete");
+}
+
+void preparePowerResponse() {
+  response_buffer[0] = RESP_POWER;
+  response_buffer[1] = power_mode;
+  response_buffer[2] = sleep_flags;
+  response_buffer[3] = wake_motors_reinited ? 0x01 : 0x00;
+  response_buffer[4] = 0x00; // Reserved
+  response_buffer[5] = 0x00; // Reserved
+  response_buffer[6] = 0x00; // Reserved
+  response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
+
+  response_ready = true;
 }
 
 float readBatteryVoltage() {
@@ -270,9 +385,9 @@ void prepareStatusResponse() {
   response_buffer[3] = 0x00; // Reserved (was motor temp)
   response_buffer[4] = 0x00; // Reserved (was motor temp)
   response_buffer[5] = fault_code;
-  response_buffer[6] = 0x00; // Reserved
+  response_buffer[6] = power_mode; // Current power mode (was reserved)
   response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
-  
+
   response_ready = true;
 }
 
@@ -377,10 +492,20 @@ void processCommand() {
   uint8_t cmd_id = i2c_buffer[0];
   
   if (cmd_id == CMD_MOVE) {
+    if (power_mode == POWER_MODE_SLEEP) {
+      // The Jetson streams MOVE at 30Hz even while the robot sleeps (its
+      // I2C loop stays up for battery monitoring). Keep the motors quiet
+      // and just answer with the last known position; waking is only done
+      // explicitly via CMD_POWER.
+      preparePositionResponse();
+      command_ready = false;
+      return;
+    }
+
     // Extract speed and turn values using utility function
     int16_t speed = combineInt16(i2c_buffer[1], i2c_buffer[2]);
     int16_t turn = combineInt16(i2c_buffer[3], i2c_buffer[4]);
-    
+
     latestSpeedCmd = speed;
     latestTurnCmd = turn;
 
@@ -388,20 +513,29 @@ void processCommand() {
     Serial.print(speed);
     Serial.print(", Turn: ");
     Serial.println(turn);
-    
+
     // Execute motor command through MotorControl class
     motorControl.executeCommand(speed, turn);
-    
+
     // Prepare position response
     preparePositionResponse();
-    
+
   } else if (cmd_id == CMD_STATUS) {
     Serial.println("Status request received");
     prepareStatusResponse();
     
   } else if (cmd_id == CMD_CALIBRATE) {
+    if (power_mode == POWER_MODE_SLEEP) {
+      // IMU is in hardware sleep - calibration cannot run. Wake first.
+      Serial.println("Calibration refused - robot is in sleep mode");
+      calibration_status = 2; // Failure
+      prepareCalibrateResponse();
+      command_ready = false;
+      return;
+    }
+
     Serial.println("Calibration command received. Resetting position and heading...");
-    
+
     // Set calibration flag to prevent IMU updates
     calibration_in_progress = true;
     
@@ -468,7 +602,26 @@ void processCommand() {
     memset(&response_buffer[3], 0x00, 4); // Clear reserved bytes
     response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
     response_ready = true;
-    
+
+  } else if (cmd_id == CMD_POWER) {
+    uint8_t requested_mode = i2c_buffer[1];
+    uint8_t requested_flags = i2c_buffer[2];
+
+    Serial.print("Power command - Mode: 0x");
+    Serial.print(requested_mode, HEX);
+    Serial.print(", Flags: 0x");
+    Serial.println(requested_flags, HEX);
+
+    if (requested_mode == POWER_MODE_SLEEP) {
+      enterSleep(requested_flags);
+    } else if (requested_mode == POWER_MODE_ACTIVE) {
+      exitSleep();
+    } else {
+      Serial.println("Unknown power mode - reporting current state");
+    }
+
+    preparePowerResponse();
+
   } else {
     Serial.print("Unknown command ID: 0x");
     Serial.println(cmd_id, HEX);
@@ -523,28 +676,11 @@ void setup() {
 
 // ---------------------------------------------------------------------
 void loop() {
-  
-  // Update IMU readings
-  imuControl.update();
-  
-  // Update heading from IMU when available
-  if (!calibration_in_progress && imuControl.isConnected() && imuControl.headingAvailable()) {
-    float heading = imuControl.getHeading();
-    // Update motor control heading directly
-    motorControl.updateHeadingFromIMU(heading);
-  }
-  
-  // Process any received I2C commands
+
+  // Process any received I2C commands first so a wake command takes
+  // effect before this pass decides which path to run
   processCommand();
-  
-  motorControl.executeCommand(latestSpeedCmd, latestTurnCmd);
-  // Process motor feedback to get actual RPM data
-  motorControl.processFeedback();
-  
-  // Update buzzer for low voltage warning (independent of Jetson communication)
-  updateBuzzer();
-  updateReset();
-  
+
   // Update system status periodically
   static unsigned long last_status_update = 0;
   if (millis() - last_status_update > 1000) { // Update every second
@@ -552,7 +688,32 @@ void loop() {
     battery_voltage = readBatteryVoltage();
     last_status_update = millis();
   }
-  
+
+  // Safety paths run in every power mode
+  updateBuzzer();
+  updateReset();
+
+  if (power_mode == POWER_MODE_SLEEP) {
+    // Low-power path: no motor UART traffic, no IMU polling. I2C stays
+    // responsive (interrupt driven), battery/buzzer/cutoff stay active.
+    delay(SLEEP_LOOP_DELAY_MS);
+    return;
+  }
+
+  // Update IMU readings
+  imuControl.update();
+
+  // Update heading from IMU when available
+  if (!calibration_in_progress && imuControl.isConnected() && imuControl.headingAvailable()) {
+    float heading = imuControl.getHeading();
+    // Update motor control heading directly
+    motorControl.updateHeadingFromIMU(heading);
+  }
+
+  motorControl.executeCommand(latestSpeedCmd, latestTurnCmd);
+  // Process motor feedback to get actual RPM data
+  motorControl.processFeedback();
+
   // Small delay to prevent overwhelming the loop
   delay(1);
 }

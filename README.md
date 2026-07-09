@@ -150,6 +150,38 @@ Commands are sent from the main computer to the microcontroller. The first byte 
 | 3–8 | Reserved | 6 | All `0x00` |
 | 9 | **CRC** | 1 | CRC-8/MAXIM over bytes 2–8 |
 
+### 4.5. Power Mode Command
+
+- **Command ID:** `0x06`
+- **Purpose:** Put the microcontroller into low-power sleep mode, or wake it back to active mode.
+
+**Full 10-byte Layout:**
+
+| Byte Offset | Field | Size | Value / Description |
+| --- | --- | --- | --- |
+| 0–1 | **SOM** | 2 | `0x69 0x69` |
+| 2 | Cmd ID | 1 | `0x06` |
+| 3 | Power Mode | 1 | 0x00 = Active (wake), 0x01 = Sleep |
+| 4 | Sleep Flags | 1 | Bitfield, only used when entering sleep. Bit 0: gate the HSSW peripheral rail off for the duration of sleep. |
+| 5–8 | Reserved | 4 | All `0x00` |
+| 9 | **CRC** | 1 | CRC-8/MAXIM over bytes 2–8 |
+
+**Sleep mode behavior:**
+
+- Motors receive a final zero-speed command, then all motor UART traffic stops.
+- The ICM-20948 IMU is put into hardware sleep (configuration retained).
+- The main loop drops from ~1 kHz to ~50 Hz.
+- I2C stays fully responsive; battery monitoring, the low-voltage buzzer, and the low-voltage cutoff keep running.
+- Movement commands (`0x01`) received during sleep are acknowledged with a position response but do **not** drive the motors. Waking is only done explicitly via this command with mode 0x00.
+- Calibration commands (`0x04`) received during sleep are refused with a Failure status.
+- If bit 0 of the Sleep Flags is set, the HSSW enable pin is held low for the whole sleep period (including through low-voltage recovery and reset cycles). The EFUSE rail is never gated by sleep — it powers the main computer.
+
+**Wake behavior:**
+
+- The HSSW rail is restored (unless the low-voltage cutoff is active).
+- If the rail was gated during sleep, the firmware waits 200 ms for the rail to settle and then re-sends motor ID/mode configuration in case the motor drivers were power cycled.
+- The IMU is woken and its DMP/FIFO reset so the first heading after wake is fresh.
+
 ---
 
 ## 5. Response Message Types
@@ -201,7 +233,7 @@ Responses are sent from the microcontroller back to the main computer. The conve
     | 3–4 | Battery Voltage | 2 bytes | 16‑bit unsigned value representing battery voltage scaled by 100 (e.g., 12.34V → 1234). |
     | 5–6 | Motor Temperature | 2 bytes | 16‑bit value for motor temperature (units and scaling defined by the system). |
     | 7 | Fault Code | 1 byte | Fault code or bitfield indicating errors or warnings. |
-    | 8 | Reserved | 1 byte | Reserved for future use; set to `0x00`. |
+    | 8 | Power Mode | 1 byte | Current power mode: 0x00 = Active, 0x01 = Sleep. (Previously reserved.) |
     | 9 | **CRC** | 1 byte | CRC‑8/MAXIM computed over bytes 2–8. |
 
 ### 5.4. Calibration Response
@@ -217,6 +249,23 @@ Responses are sent from the microcontroller back to the main computer. The conve
 | 2 | Resp ID | 1 | `0x84` |
 | 3 | Status | 1 | 0 = Success, 1 = In Progress, 2 = Failure |
 | 4–8 | Reserved | 5 | All `0x00` |
+| 9 | **CRC** | 1 | CRC-8/MAXIM over bytes 2–8 |
+
+### 5.5. Power Mode Response
+
+- **Response ID:** `0x86` (i.e. `0x06 + 0x80`)
+- **Purpose:** Report the power mode state after a Power Mode command.
+
+**Full 10-byte Layout:**
+
+| Byte Offset | Field | Size | Value / Description |
+| --- | --- | --- | --- |
+| 0–1 | **SOM** | 2 | `0x69 0x69` |
+| 2 | Resp ID | 1 | `0x86` |
+| 3 | Power Mode | 1 | Current mode: 0x00 = Active, 0x01 = Sleep |
+| 4 | Sleep Flags | 1 | Active sleep flags (0x00 when awake) |
+| 5 | Motors Reinit | 1 | 0x01 if the motor drivers were re-initialized on the last wake (rail was gated), else 0x00 |
+| 6–8 | Reserved | 3 | All `0x00` |
 | 9 | **CRC** | 1 | CRC-8/MAXIM over bytes 2–8 |
 
 ---
@@ -247,6 +296,12 @@ The battery voltage is read through pin A5 using a voltage divider circuit with 
 - **Top Resistor (R_TOP):** 13.3 kΩ
 - **Bottom Resistor (R_BOTTOM):** 4.7 kΩ  
 - **ADC Reference Voltage:** 3.3V
-- **ADC Resolution:** 10-bit (0-1023)
+- **ADC Resolution:** 12-bit (0–4095)
 
-The voltage conversion formula is: 
+The voltage conversion formula is:
+
+```
+pin_voltage    = raw_adc * (3.3 / 4095)
+battery_voltage = pin_voltage * (R_TOP + R_BOTTOM) / R_BOTTOM
+                = pin_voltage * (13.3 + 4.7) / 4.7
+```

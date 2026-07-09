@@ -31,6 +31,17 @@ public:
   /** Process incoming bytes to update RPM feedback from both motors */
   void processFeedback();
 
+  /**
+   * Re-send motor ID and speed-loop mode to both drivers.
+   * Used after waking from sleep with the HSSW rail gated, in case the
+   * drivers were power cycled and lost their configuration. Blocks for
+   * ~350ms of configuration delays.
+   */
+  void reinit();
+
+  /** Discard any buffered/unread feedback bytes from both motors */
+  void flushFeedback();
+
   /** True if fresh RPM readings are available */
   bool available();
 

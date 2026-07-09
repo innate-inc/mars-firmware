@@ -107,6 +107,27 @@ void MotorControl::sendMotorSpeeds(int16_t left_speed, int16_t right_speed) {
   sendMotorCommand(*_serialRight, right_speed);
 }
 
+void MotorControl::reinit() {
+  setMotorID(*_serialLeft);
+  setMotorID(*_serialRight);
+  delay(100);
+
+  setMotorMode(*_serialLeft);
+  setMotorMode(*_serialRight);
+  delay(20);
+
+  Serial.println("Motors re-initialized");
+}
+
+void MotorControl::flushFeedback() {
+  while (_serialLeft->available()) _serialLeft->read();
+  while (_serialRight->available()) _serialRight->read();
+  _leftBufIndex = 0;
+  _rightBufIndex = 0;
+  _newLeftRPM = false;
+  _newRightRPM = false;
+}
+
 void MotorControl::processFeedback() {
   // Process feedback from left motor
   processMotorFeedback(_leftBuffer, _leftBufIndex, _lastLeftRPM, _newLeftRPM);

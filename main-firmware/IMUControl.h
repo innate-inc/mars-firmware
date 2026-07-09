@@ -50,6 +50,14 @@ public:
   bool isConnected() const;
 
   /**
+   * Put the ICM-20948 into (or out of) hardware sleep.
+   * Register/DMP configuration is retained; on wake the DMP and FIFO are
+   * reset so no stale samples are consumed. update() is a no-op while
+   * asleep.
+   */
+  void setSleep(bool enable);
+
+  /**
    * Get raw accelerometer and gyro data for debugging
    */
   void getAccelGyro(float &ax, float &ay, float &az, float &gx, float &gy, float &gz);
@@ -67,6 +75,7 @@ private:
   float _headingOffset;   // Offset to make current heading = 0 at calibration
   bool _newHeadingData;
   bool _initialized;
+  bool _sleeping;
   
   // DMP data structure
   icm_20948_DMP_data_t _dmpData;
