@@ -83,6 +83,11 @@ private:
   // IMU integration
   IMUControl* _imuControl;
   bool _useIMUHeading;
+
+  // Yaw-rate feedback loop state
+  float _yawRateI;
+  float _lastYawCorrection;
+  unsigned long _lastYawUs;
   
   // Communication buffers
   static const size_t BUFFER_SIZE = 64;
@@ -95,11 +100,19 @@ private:
   static const int16_t MAX_MOTOR_SPEED = 2100;
   static const int WHEEL_DIAMETER = 69;      // Wheel diameter in mm
   static const int TRACK_WIDTH = 189;       // Distance between motors in mm
+
+  // Yaw-rate loop gains, in RPM of wheel differential per rad/s of yaw
+  // error. Reference scale: feedforward is ~26 RPM per rad/s commanded.
+  static constexpr float YAW_KP = 15.0f;
+  static constexpr float YAW_KI = 60.0f;         // per second
+  static constexpr float YAW_I_LIMIT = 15.0f;    // integrator clamp (RPM)
+  static constexpr float YAW_CORR_LIMIT = 25.0f; // total correction clamp (RPM)
   
   // Static instance for SERCOM4 interrupt handling
   static MotorControl* _instance;
   
   // Private methods
+  float yawRateCorrection(float omega_cmd);
   uint8_t calculateCRC(const uint8_t* data, int len);
   void setMotorID(Stream &motorSerial);
   void setMotorMode(Stream &motorSerial);

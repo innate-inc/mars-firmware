@@ -15,7 +15,8 @@ MotorControl::MotorControl()
     _currentX(0.0f), _currentY(0.0f), _currentTheta(0.0f),
     _lastUpdateTime(0),
     _leftBufIndex(0), _rightBufIndex(0),
-    _imuControl(nullptr), _useIMUHeading(false)
+    _imuControl(nullptr), _useIMUHeading(false),
+    _yawRateI(0.0f), _lastYawCorrection(0.0f), _lastYawUs(0)
 {
   // Register this instance for SERCOM4 interrupt handling
   _instance = this;
@@ -78,6 +79,12 @@ void MotorControl::executeCommand(int16_t speed_cmd, int16_t turn_cmd) {
   // Calculate the differential adjustment based on the turn rate (scaled by 100)
   float omega = turn_cmd / 100.0;
   float delta = (omega * TRACK_WIDTH * 60.0) / (2.0 * wheelCircumference);
+
+  // The hub motors' internal velocity loops sag under tire-scrub load
+  // (worse on carpet) and the caster kicks the heading at motion onset,
+  // so open-loop delta alone under- or over-rotates. Trim it with a PI
+  // loop on the IMU yaw rate.
+  delta += yawRateCorrection(omega);
   
   // For forward motion, both motors should run in the same direction
   float leftRPM = targetRPM + delta;
@@ -232,6 +239,32 @@ void MotorControl::forceResetHeading() {
 }
 
 // Private methods
+
+float MotorControl::yawRateCorrection(float omega_cmd) {
+  if (!_useIMUHeading || _imuControl == nullptr) return 0.0f;
+
+  unsigned long now_us = micros();
+  float dt = (now_us - _lastYawUs) * 1e-6f;
+  if (dt < 0.01f) return _lastYawCorrection;  // 100 Hz cap, matches IMU rate
+  _lastYawUs = now_us;
+  if (dt > 0.1f) dt = 0.1f;
+
+  // Firmware omega is CW-positive (positive delta speeds the LEFT wheel);
+  // the gyro z axis is CCW-positive (it is the source of _currentTheta).
+  float omega_meas = -_imuControl->getYawRateRad();
+
+  if (omega_cmd == 0.0f && _lastLeftSpeed == 0 && _lastRightSpeed == 0) {
+    // At rest: no correction, and no windup from gyro bias.
+    _yawRateI = 0.0f;
+    _lastYawCorrection = 0.0f;
+    return 0.0f;
+  }
+
+  float err = omega_cmd - omega_meas;
+  _yawRateI = constrain(_yawRateI + err * dt * YAW_KI, -YAW_I_LIMIT, YAW_I_LIMIT);
+  _lastYawCorrection = constrain(YAW_KP * err + _yawRateI, -YAW_CORR_LIMIT, YAW_CORR_LIMIT);
+  return _lastYawCorrection;
+}
 
 uint8_t MotorControl::calculateCRC(const uint8_t* data, int len) {
   return calculateCRC8Maxim(data, len);  // Use Utils function

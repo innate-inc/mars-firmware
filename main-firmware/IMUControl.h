@@ -54,6 +54,11 @@ public:
    */
   void getAccelGyro(float &ax, float &ay, float &az, float &gx, float &gy, float &gz);
 
+  /**
+   * Get yaw rate (gyro z) in rad/s, CCW-positive (same convention as heading)
+   */
+  float getYawRateRad();
+
 private:
   // Custom I2C for ICM-20948
   TwoWire _customI2C;

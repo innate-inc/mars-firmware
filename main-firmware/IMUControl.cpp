@@ -88,6 +88,12 @@ bool IMUControl::isConnected() const {
   return _initialized && const_cast<ICM_20948_I2C&>(_imu).isConnected();
 }
 
+float IMUControl::getYawRateRad() {
+  if (!_initialized) return 0.0f;
+  _imu.getAGMT();
+  return _imu.gyrZ() * (PI / 180.0f);  // library returns deg/s
+}
+
 void IMUControl::getAccelGyro(float &ax, float &ay, float &az, float &gx, float &gy, float &gz) {
   if (!_initialized) {
     ax = ay = az = gx = gy = gz = 0.0f;
