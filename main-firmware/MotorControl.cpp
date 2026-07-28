@@ -241,7 +241,15 @@ void MotorControl::forceResetHeading() {
 // Private methods
 
 float MotorControl::yawRateCorrection(float omega_cmd) {
-  if (!_useIMUHeading || _imuControl == nullptr) return 0.0f;
+  static unsigned long lastDbgMs = 0;
+
+  if (!_useIMUHeading || _imuControl == nullptr) {
+    if (millis() - lastDbgMs > 2000) {
+      lastDbgMs = millis();
+      Serial.println("[yaw] loop INACTIVE (IMU unavailable) - heading will NOT track");
+    }
+    return 0.0f;
+  }
 
   unsigned long now_us = micros();
   float dt = (now_us - _lastYawUs) * 1e-6f;
@@ -252,6 +260,22 @@ float MotorControl::yawRateCorrection(float omega_cmd) {
   // Firmware omega is CW-positive (positive delta speeds the LEFT wheel);
   // the gyro z axis is CCW-positive (it is the source of _currentTheta).
   float omega_meas = -_imuControl->getYawRateRad();
+
+  // 1 Hz health line: rotate the robot by hand and meas/hdg must move even
+  // with zero commands; corr/I engage only while commands are active.
+  if (millis() - lastDbgMs > 1000) {
+    lastDbgMs = millis();
+    Serial.print("[yaw] cmd=");
+    Serial.print(omega_cmd, 3);
+    Serial.print(" meas=");
+    Serial.print(omega_meas, 3);
+    Serial.print(" corr_rpm=");
+    Serial.print(_lastYawCorrection, 1);
+    Serial.print(" I=");
+    Serial.print(_yawRateI, 1);
+    Serial.print(" hdg_deg=");
+    Serial.println(_currentTheta * 180.0f / PI, 1);
+  }
 
   if (omega_cmd == 0.0f && _lastLeftSpeed == 0 && _lastRightSpeed == 0) {
     // At rest: no correction, and no windup from gyro bias.
