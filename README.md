@@ -150,6 +150,55 @@ Commands are sent from the main computer to the microcontroller. The first byte 
 | 3–8 | Reserved | 6 | All `0x00` |
 | 9 | **CRC** | 1 | CRC-8/MAXIM over bytes 2–8 |
 
+### 4.5. Buzzer Command (R7.1 addition)
+
+- **Command ID:** `0x06`
+- **Purpose:** Control the buzzer: query state, manual on/off, snooze the low battery warning, or enable/disable the low battery warning entirely.
+- **Payload Layout (Bytes 2–8):**
+
+    | Byte Offset | Field | Size | Description |
+    | --- | --- | --- | --- |
+    | 2 | Cmd ID | 1 byte | `0x06` (Buzzer command) |
+    | 3 | Sub-command | 1 byte | `0x00` = Query, `0x01` = Manual ON, `0x02` = Manual OFF, `0x03` = Snooze low battery warning, `0x04` = Cancel snooze, `0x05` = Enable low battery warning, `0x06` = Disable low battery warning |
+    | 4–5 | Snooze Duration | 2 bytes | Only used with sub-command `0x03`: 16-bit unsigned snooze duration in seconds (`0` = default 60 s). Byte 4 is high byte. |
+    | 6–8 | Reserved | 3 bytes | Set to `0x00`. |
+    | 9 | **CRC** | 1 byte | CRC‑8/MAXIM computed over bytes 2–8. |
+
+    **Behavior notes:**
+    - The low battery warning pattern (3 beeps + 10 s pause) acts like an interrupt: while active it overrides the manual buzzer state; when it ends (or is snoozed/disabled) the buzzer returns to the manual state.
+    - Snooze suppresses only the low battery *warning* pattern; it auto-expires after the requested duration and is cleared when the battery voltage recovers above the hysteresis threshold.
+    - The constant beep in the low voltage *cutoff* state is not snoozable (the e-fuse has already cut Jetson power at that point).
+
+### 4.6. High Side Switch Command (R7.1 addition)
+
+- **Command ID:** `0x07`
+- **Purpose:** Query or set the high side switch (HSSW) output directly, in addition to the fixed-duration pulse of the Reset command (`0x05`).
+- **Payload Layout (Bytes 2–8):**
+
+    | Byte Offset | Field | Size | Description |
+    | --- | --- | --- | --- |
+    | 2 | Cmd ID | 1 byte | `0x07` (HSSW command) |
+    | 3 | Sub-command | 1 byte | `0x00` = Query, `0x01` = ON, `0x02` = OFF |
+    | 4–8 | Reserved | 5 bytes | Set to `0x00`. |
+    | 9 | **CRC** | 1 byte | CRC‑8/MAXIM computed over bytes 2–8. |
+
+    **Behavior notes:**
+    - `ON` is rejected while the low voltage cutoff is latched (the firmware is forcing the HSSW off to protect the battery).
+    - A Reset command (`0x05`) targeting the HSSW still pulses it off for 1 s; the pulse always ends with the HSSW on (commanded state is set back to ON).
+    - The commanded state survives a low-battery cutoff/recovery cycle: on voltage recovery the HSSW is restored to the last commanded state, not blindly turned on.
+
+### 4.7. IMU Orientation Request (R7.1 addition)
+
+- **Command ID:** `0x08`
+- **Purpose:** Request the full IMU orientation (roll, pitch, yaw) rather than only the heading embedded in the Movement response.
+- **Payload Layout:** Bytes 3–8 reserved (`0x00`), CRC over bytes 2–8.
+
+### 4.8. Firmware Version Request (R7.1 addition)
+
+- **Command ID:** `0x09`
+- **Purpose:** Query the firmware version so the main computer can detect which protocol features are available. Firmware older than 7.1 does not answer this command (the response read will return all zeros), which itself signals that only the base R6 command set is supported.
+- **Payload Layout:** Bytes 3–8 reserved (`0x00`), CRC over bytes 2–8.
+
 ---
 
 ## 5. Response Message Types
@@ -201,7 +250,7 @@ Responses are sent from the microcontroller back to the main computer. The conve
     | 3–4 | Battery Voltage | 2 bytes | 16‑bit unsigned value representing battery voltage scaled by 100 (e.g., 12.34V → 1234). |
     | 5–6 | Motor Temperature | 2 bytes | 16‑bit value for motor temperature (units and scaling defined by the system). |
     | 7 | Fault Code | 1 byte | Fault code or bitfield indicating errors or warnings. |
-    | 8 | Reserved | 1 byte | Reserved for future use; set to `0x00`. |
+    | 8 | System Flags | 1 byte | **R7.1 addition** (previously reserved, always `0x00`): system flags bitfield — see [Section 5.9](#59-system-flags-bitfield). Firmware older than 7.1 always sends `0x00` here, so parsers that ignored this byte remain compatible. |
     | 9 | **CRC** | 1 byte | CRC‑8/MAXIM computed over bytes 2–8. |
 
 ### 5.4. Calibration Response
@@ -218,6 +267,73 @@ Responses are sent from the microcontroller back to the main computer. The conve
 | 3 | Status | 1 | 0 = Success, 1 = In Progress, 2 = Failure |
 | 4–8 | Reserved | 5 | All `0x00` |
 | 9 | **CRC** | 1 | CRC-8/MAXIM over bytes 2–8 |
+
+### 5.5. Buzzer Response (R7.1 addition)
+
+- **Response ID:** `0x86` (i.e., 0x06 + 0x80)
+- **Purpose:** Report buzzer and low battery warning state. Sent in reply to any Buzzer command, including queries.
+- **Payload Layout (Bytes 2–8):**
+
+    | Byte Offset | Field | Size | Description |
+    | --- | --- | --- | --- |
+    | 2 | Response ID | 1 byte | `0x86` |
+    | 3 | System Flags | 1 byte | Bitfield — see [Section 5.9](#59-system-flags-bitfield). |
+    | 4–5 | Snooze Remaining | 2 bytes | 16-bit unsigned seconds remaining on the current snooze (`0` if not snoozed). Byte 4 is high byte. |
+    | 6 | Ack | 1 byte | `0x00` = sub-command accepted, `0x01` = unknown sub-command. |
+    | 7–8 | Reserved | 2 bytes | `0x00`. |
+    | 9 | **CRC** | 1 byte | CRC‑8/MAXIM computed over bytes 2–8. |
+
+### 5.6. High Side Switch Response (R7.1 addition)
+
+- **Response ID:** `0x87` (i.e., 0x07 + 0x80)
+- **Purpose:** Report HSSW state and current-sense telemetry. Sent in reply to any HSSW command, including queries.
+- **Payload Layout (Bytes 2–8):**
+
+    | Byte Offset | Field | Size | Description |
+    | --- | --- | --- | --- |
+    | 2 | Response ID | 1 byte | `0x87` |
+    | 3 | Commanded State | 1 byte | `0x01` = ON commanded, `0x00` = OFF commanded. |
+    | 4 | System Flags | 1 byte | Bitfield — see [Section 5.9](#59-system-flags-bitfield). |
+    | 5–6 | Current Sense | 2 bytes | Raw 12-bit ADC reading of the HSSW current-sense pin (A0), 16-bit unsigned, byte 5 is high byte. |
+    | 7 | Actual Pin Level | 1 byte | `0x01` = HSSW enable pin currently high, `0x00` = low (can differ from commanded state during a reset pulse or cutoff). |
+    | 8 | Ack | 1 byte | `0x00` = accepted, `0x01` = ON rejected due to low voltage cutoff, `0x02` = unknown sub-command. |
+    | 9 | **CRC** | 1 byte | CRC‑8/MAXIM computed over bytes 2–8. |
+
+### 5.7. IMU Orientation Response (R7.1 addition)
+
+- **Response ID:** `0x88` (i.e., 0x08 + 0x80)
+- **Purpose:** Report the full IMU orientation.
+- **Payload Layout (Bytes 2–8):**
+
+    | Byte Offset | Field | Size | Description |
+    | --- | --- | --- | --- |
+    | 2 | Response ID | 1 byte | `0x88` |
+    | 3–4 | Roll | 2 bytes | 16-bit signed roll (rotation about X) in **milliradians**. |
+    | 5–6 | Pitch | 2 bytes | 16-bit signed pitch (rotation about Y) in **milliradians**. |
+    | 7–8 | Yaw | 2 bytes | 16-bit signed yaw (heading, calibration offset applied — same angle as Theta in the Movement response) in **milliradians**. |
+    | 9 | **CRC** | 1 byte | CRC‑8/MAXIM computed over bytes 2–8. |
+
+    **Note:** All three fields are set to `0x7FFF` (32767) when the IMU is not connected. Milliradian scaling (×1000) gives ~0.057° resolution, finer than the ×100 radian scaling used for Theta in the Movement response; the legacy Theta field is unchanged.
+
+### 5.8. Firmware Version Response (R7.1 addition)
+
+- **Response ID:** `0x89` (i.e., 0x09 + 0x80)
+- **Payload Layout:** Byte 3 = major version, byte 4 = minor version (e.g., `7`, `1` for firmware R7.1), bytes 5–8 reserved (`0x00`), CRC over bytes 2–8.
+
+### 5.9. System Flags Bitfield
+
+Shared bitfield reported in the Status response (byte 8), Buzzer response (byte 3), and HSSW response (byte 4):
+
+| Bit | Mask | Meaning |
+| --- | --- | --- |
+| 0 | `0x01` | Buzzer pin currently driven high |
+| 1 | `0x02` | Low voltage warning latched (battery dipped below 10.5 V, not yet recovered above 11.0 V) |
+| 2 | `0x04` | Low voltage cutoff latched (battery dipped below 10.3 V — HSSW and e-fuse forced off) |
+| 3 | `0x08` | Low battery buzzer currently snoozed |
+| 4 | `0x10` | Low battery buzzer enabled (default 1) |
+| 5 | `0x20` | HSSW commanded on |
+| 6 | `0x40` | Buzzer manually commanded on |
+| 7 | `0x80` | Reset pulse in progress |
 
 ---
 
@@ -247,6 +363,44 @@ The battery voltage is read through pin A5 using a voltage divider circuit with 
 - **Top Resistor (R_TOP):** 13.3 kΩ
 - **Bottom Resistor (R_BOTTOM):** 4.7 kΩ  
 - **ADC Reference Voltage:** 3.3V
-- **ADC Resolution:** 10-bit (0-1023)
+- **ADC Resolution:** 12-bit (0–4095) — the firmware calls `analogReadResolution(12)` on the ItsyBitsy M4
 
-The voltage conversion formula is: 
+The voltage conversion formula is:
+
+```
+V_battery = (raw / 4095) × 3.3 × (R_TOP + R_BOTTOM) / R_BOTTOM
+```
+
+---
+
+## 8. Firmware Update over I2C — Feasibility (R7.1 analysis)
+
+**Question:** Can the Jetson reflash the MCU over the existing I2C bus, given that the Jetson's own power depends on the MCU holding the e-fuse enable line high?
+
+**Short answer:** Not with the stock setup, but yes with an application-level A/B update scheme — with one hardware caveat around the reset moment.
+
+### Why it doesn't work today
+
+The ItsyBitsy M4's stock UF2 bootloader (16 KB, protected region at the start of flash) only speaks **USB**: UF2 drag-and-drop mass storage and BOSSA/SAM-BA over USB CDC. It has no I2C download path, so the Jetson cannot talk to it. Entering the bootloader also tristates all GPIO — the e-fuse enable (pin 10) would float, the e-fuse would drop, and the Jetson would power itself off while sitting in a bootloader that waits forever for USB. That is the bricking scenario to avoid.
+
+### Recommended approach: application-level A/B update (no bootloader changes)
+
+The SAMD51 has 512 KB of flash in **two independently writable banks** (BANKA/BANKB, 256 KB each) and native NVMCTRL support for **bank swapping** (`BKSWRST` command swaps which bank is mapped to address 0 and resets). The current firmware uses ~64 KB, so an entire new image fits in the inactive bank with a wide margin. The update flow:
+
+1. **Transfer:** Add new I2C commands (e.g., `0x0A` update-begin / `0x0B` data-chunk / `0x0C` verify+commit). The running application receives the image in chunks (a new, longer I2C write frame with a sequence number and per-chunk CRC), erasing/writing the inactive bank as it goes. The robot stays fully operational during transfer — the running code is untouched, and I2C writes to flash can be paced so motor/battery/buzzer duties are not starved.
+2. **Verify:** After the last chunk, the MCU checks a whole-image CRC32 before anything irreversible happens. A failed transfer is harmless: the active bank still runs, just start over.
+3. **Commit:** Issue `BKSWRST`. The MCU resets into the new image; the old image remains intact in the now-inactive bank for rollback (pair this with a watchdog + "boot confirmed" command from the Jetson: if the new firmware never gets confirmed, swap back).
+
+### The reset-moment caveat
+
+During the `BKSWRST` reset, GPIO tristates until the new application re-asserts `EFUSE_EN`. As of R7.1, `setup()` asserts the power pins **first**, before serial delays and the (potentially blocking) IMU init, so the gap is roughly the POR + bootloader-jump time — on the order of ~100 ms. What happens in that window depends on the e-fuse enable circuit:
+
+- If `EFUSE_EN` has a pull-up or RC hold-up that keeps the e-fuse enabled for ~200 ms, the Jetson never notices. **Recommended next PCB rev change if not already present.**
+- If the enable floats off, the Jetson browns out and reboots. This is annoying but *not* a brick: the MCU completes the bank swap autonomously once the image is transferred, boots the new firmware, re-asserts the e-fuse, and the Jetson comes back up on new firmware.
+
+The unrecoverable-without-USB case is a new image that hard-faults before asserting `EFUSE_EN`. The CRC check plus watchdog-rollback closes most of that gap; keeping the power-pin assertions as the first statements of `setup()` (and never moving them) closes the rest.
+
+### Alternatives considered
+
+- **Custom I2C bootloader** (fork the UF2 bootloader to assert `EFUSE_EN` immediately at reset and act as an I2C follower for DFU): fully robust against bad application images, but bootloader development is high-risk — a bad bootloader flash requires SWD to recover — and it duplicates what the A/B scheme achieves in the application.
+- **SWD from the Jetson** (2 wires: SWDIO/SWCLK from Jetson GPIO to the MCU's SWD pads, driven by OpenOCD's `linuxgpiod` bitbang driver): the most robust option — it can recover a fully bricked MCU, and while the core is halted for flashing the GPIO output latches retain their state, so `EFUSE_EN` stays high during programming. Requires two traces/wires that don't exist on the current board; worth adding on the next PCB revision as a recovery path even if I2C A/B update is the everyday mechanism.

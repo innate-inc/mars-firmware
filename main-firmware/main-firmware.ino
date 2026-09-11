@@ -20,12 +20,50 @@
 #define CMD_STATUS 0x03
 #define CMD_CALIBRATE 0x04
 #define CMD_RESET 0x05
+#define CMD_BUZZER 0x06     // Buzzer control (query/on/off/snooze/enable/disable)
+#define CMD_HSSW 0x07       // High side switch control (query/on/off)
+#define CMD_IMU 0x08        // Full IMU orientation request (roll/pitch/yaw)
+#define CMD_VERSION 0x09    // Firmware version request
 
 // Response definitions (MCU → Jetson)
 #define RESP_MOVE 0x81      // Position feedback
 #define RESP_STATUS 0x83    // Health data
 #define RESP_CALIBRATE 0x84 // Calibration status
 #define RESP_RESET 0x85     // Component Reset
+#define RESP_BUZZER 0x86    // Buzzer state
+#define RESP_HSSW 0x87      // High side switch state
+#define RESP_IMU 0x88       // Full IMU orientation (roll/pitch/yaw)
+#define RESP_VERSION 0x89   // Firmware version
+
+// Firmware version (reported via CMD_VERSION so the Jetson can detect capabilities)
+#define FW_VERSION_MAJOR 7
+#define FW_VERSION_MINOR 1
+
+// Buzzer sub-commands (byte 1 of CMD_BUZZER)
+#define BUZZER_QUERY 0x00
+#define BUZZER_MANUAL_ON 0x01
+#define BUZZER_MANUAL_OFF 0x02
+#define BUZZER_SNOOZE 0x03       // bytes 2-3 = snooze duration in seconds (0 = default)
+#define BUZZER_UNSNOOZE 0x04
+#define BUZZER_LOWBATT_ENABLE 0x05
+#define BUZZER_LOWBATT_DISABLE 0x06
+
+#define BUZZER_DEFAULT_SNOOZE_S 60
+
+// HSSW sub-commands (byte 1 of CMD_HSSW)
+#define HSSW_QUERY 0x00
+#define HSSW_ON 0x01
+#define HSSW_OFF 0x02
+
+// System flags bitfield (RESP_STATUS byte 6, RESP_BUZZER byte 1, RESP_HSSW byte 2)
+#define SYSFLAG_BUZZER_ON        0x01  // Buzzer pin currently driven high
+#define SYSFLAG_LOWBATT_WARNING  0x02  // Low voltage warning latched (hysteresis)
+#define SYSFLAG_LOWBATT_CUTOFF   0x04  // Low voltage cutoff latched
+#define SYSFLAG_BUZZER_SNOOZED   0x08  // Low battery buzzer currently snoozed
+#define SYSFLAG_BUZZER_ENABLED   0x10  // Low battery buzzer enabled
+#define SYSFLAG_HSSW_COMMANDED   0x20  // HSSW commanded on
+#define SYSFLAG_BUZZER_MANUAL    0x40  // Buzzer manually commanded on
+#define SYSFLAG_RESET_ACTIVE     0x80  // Reset pulse in progress
 
 // ---------------------------------------------------------------------
 // Battery monitoring constants (matching reference implementation)
@@ -69,6 +107,15 @@ bool in_cycle_pause = false;
 enum BuzzerState { BUZZER_OFF, BUZZER_ON, BUZZER_PAUSE, CYCLE_PAUSE };
 BuzzerState buzzer_state = BUZZER_OFF;
 
+// Jetson-controllable buzzer state
+bool buzzer_manual_on = false;        // Jetson requested the buzzer on
+bool low_batt_buzzer_enabled = true;  // Master enable for low battery beep pattern
+unsigned long snooze_start_ms = 0;    // When the current snooze began
+unsigned long snooze_duration_ms = 0; // 0 = not snoozed
+
+// Jetson-controllable high side switch state
+bool hssw_commanded = true;           // Desired HSSW state (cutoff/reset can override the pin)
+
 // I2C communication variables
 uint8_t i2c_buffer[8];
 bool command_ready = false;
@@ -83,23 +130,73 @@ unsigned long reset_start_time = 0;
 bool reset_in_progress = false;
 
 // ---------------------------------------------------------------------
+// Buzzer helpers
+
+bool buzzerSnoozed() {
+  if (snooze_duration_ms == 0) return false;
+  if (millis() - snooze_start_ms >= snooze_duration_ms) {
+    snooze_duration_ms = 0; // Snooze expired
+    return false;
+  }
+  return true;
+}
+
+uint16_t snoozeRemainingSeconds() {
+  if (!buzzerSnoozed()) return 0;
+  unsigned long remaining_ms = snooze_duration_ms - (millis() - snooze_start_ms);
+  return (uint16_t)(remaining_ms / 1000);
+}
+
+void resetBuzzerPattern() {
+  buzzer_state = BUZZER_OFF;
+  buzz_count = 0;
+  buzzer_active = false;
+  in_cycle_pause = false;
+}
+
+// Drive the buzzer pin: low battery pattern (when active) overlays the manual state
+void applyBuzzerOutput(bool pattern_on) {
+  digitalWrite(BUZZER_PIN, (pattern_on || buzzer_manual_on) ? HIGH : LOW);
+}
+
+// System flags bitfield shared by RESP_STATUS, RESP_BUZZER, and RESP_HSSW
+uint8_t getSystemFlags() {
+  uint8_t flags = 0;
+  if (digitalRead(BUZZER_PIN)) flags |= SYSFLAG_BUZZER_ON;
+  if (hysteresis_triggered) flags |= SYSFLAG_LOWBATT_WARNING;
+  if (cutoff_triggered) flags |= SYSFLAG_LOWBATT_CUTOFF;
+  if (buzzerSnoozed()) flags |= SYSFLAG_BUZZER_SNOOZED;
+  if (low_batt_buzzer_enabled) flags |= SYSFLAG_BUZZER_ENABLED;
+  if (hssw_commanded) flags |= SYSFLAG_HSSW_COMMANDED;
+  if (buzzer_manual_on) flags |= SYSFLAG_BUZZER_MANUAL;
+  if (reset_in_progress) flags |= SYSFLAG_RESET_ACTIVE;
+  return flags;
+}
+
+// ---------------------------------------------------------------------
 // Low voltage buzzer management
 void updateBuzzer() {
   // Check recovery condition first (hysteresis)
   if (battery_voltage >= HYSTERESIS_THRESHOLD) {
+    bool was_triggered = hysteresis_triggered;
     hysteresis_triggered = false;
     cutoff_triggered = false;
-    // Voltage recovered - turn off buzzer and reset state
-    digitalWrite(BUZZER_PIN, LOW);
-    digitalWrite(HSSW_EN_PIN, HIGH);
-    digitalWrite(EFUSE_EN_PIN, HIGH);
-    buzzer_state = BUZZER_OFF;
-    buzz_count = 0;
-    buzzer_active = false;
-    in_cycle_pause = false;
+    // Voltage recovered - stop pattern, restore power rails
+    // (leave a pin alone while a reset pulse is holding it low)
+    if (!(reset_in_progress && (reset_target & RESET_HSSW))) {
+      digitalWrite(HSSW_EN_PIN, hssw_commanded ? HIGH : LOW);
+    }
+    if (!(reset_in_progress && (reset_target & RESET_EFUSE))) {
+      digitalWrite(EFUSE_EN_PIN, HIGH);
+    }
+    resetBuzzerPattern();
+    if (was_triggered) {
+      snooze_duration_ms = 0; // Clear snooze so the next low battery event beeps again
+    }
+    applyBuzzerOutput(false);
     return;
   }
-  
+
   // Latch the triggered states
   if (battery_voltage < LOW_VOLTAGE_THRESHOLD) {
     hysteresis_triggered = true;
@@ -107,54 +204,59 @@ void updateBuzzer() {
   if (battery_voltage < LOW_VOLTAGE_CUTOFF) {
     cutoff_triggered = true;
   }
-  
+
   // If hysteresis not triggered, everything is OK
   if (!hysteresis_triggered) {
-    digitalWrite(BUZZER_PIN, LOW);
-    buzzer_state = BUZZER_OFF;
-    buzz_count = 0;
-    buzzer_active = false;
-    in_cycle_pause = false;
+    resetBuzzerPattern();
+    applyBuzzerOutput(false);
     return;
   }
-  
+
   // Critical cutoff triggered - constant beep and power off
+  // Not snoozable: the EFUSE drops the Jetson here, so nobody is listening anyway
   if (cutoff_triggered) {
     digitalWrite(HSSW_EN_PIN, LOW);
     digitalWrite(EFUSE_EN_PIN, LOW);
     digitalWrite(BUZZER_PIN, HIGH); // assert buzzer on constantly when below cutoff
     return;  // Stay in cutoff state until voltage recovers above hysteresis
   }
-  
+
+  // Warning pattern suppressed while snoozed or disabled (manual control still works)
+  if (!low_batt_buzzer_enabled || buzzerSnoozed()) {
+    resetBuzzerPattern();
+    applyBuzzerOutput(false);
+    return;
+  }
+
   // Low voltage warning mode - manage buzzer pattern
   unsigned long current_time = millis();
-  
+
   switch (buzzer_state) {
     case BUZZER_OFF:
       // Start buzzer cycle
-      digitalWrite(BUZZER_PIN, HIGH);
+      applyBuzzerOutput(true);
       buzzer_start_time = current_time;
       buzzer_state = BUZZER_ON;
       buzz_count = 1;
       Serial.println("LOW VOLTAGE WARNING - Buzzer ON");
       break;
-      
+
     case BUZZER_ON:
       // Check if time elapsed
       if (current_time - buzzer_start_time >= 1000) {
-        digitalWrite(BUZZER_PIN, LOW);
+        applyBuzzerOutput(false);
         buzzer_start_time = current_time;
         buzzer_state = BUZZER_PAUSE;
         Serial.println("Buzzer OFF");
       }
       break;
-      
+
     case BUZZER_PAUSE:
       // Check if pause elapsed
       if (current_time - buzzer_start_time >= 1000) {
         if (buzz_count < 3) {
           // Continue with next buzz
-          digitalWrite(BUZZER_PIN, HIGH);
+          applyBuzzerOutput(true);
           buzzer_start_time = current_time;
           buzzer_state = BUZZER_ON;
           buzz_count++;
@@ -167,7 +269,7 @@ void updateBuzzer() {
         }
       }
       break;
-      
+
     case CYCLE_PAUSE:
       // Check if pause elapsed
       if (current_time - buzzer_start_time >= 10000) {
@@ -188,6 +290,7 @@ void updateReset() {
     // Restore the enable pins
     if (reset_target & RESET_HSSW) {
       digitalWrite(HSSW_EN_PIN, HIGH);
+      hssw_commanded = true; // A reset pulse always ends with the HSSW on
       Serial.println("HSSW restored");
     }
     if (reset_target & RESET_EFUSE) {
@@ -270,7 +373,7 @@ void prepareStatusResponse() {
   response_buffer[3] = 0x00; // Reserved (was motor temp)
   response_buffer[4] = 0x00; // Reserved (was motor temp)
   response_buffer[5] = fault_code;
-  response_buffer[6] = 0x00; // Reserved
+  response_buffer[6] = getSystemFlags(); // Was reserved (0x00); additive system flags bitfield
   response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
   
   response_ready = true;
@@ -286,6 +389,72 @@ void prepareCalibrateResponse() {
   response_buffer[6] = 0x00; // Reserved
   response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
   
+  response_ready = true;
+}
+
+void prepareBuzzerResponse(uint8_t ack) {
+  uint16_t snooze_remaining = snoozeRemainingSeconds();
+
+  response_buffer[0] = RESP_BUZZER;
+  response_buffer[1] = getSystemFlags();
+  response_buffer[2] = (snooze_remaining >> 8) & 0xFF;
+  response_buffer[3] = snooze_remaining & 0xFF;
+  response_buffer[4] = ack; // 0x00 = accepted, 0x01 = rejected/unknown sub-command
+  response_buffer[5] = 0x00; // Reserved
+  response_buffer[6] = 0x00; // Reserved
+  response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
+
+  response_ready = true;
+}
+
+void prepareHSSWResponse(uint8_t ack) {
+  uint16_t current_sense = (uint16_t)analogRead(HSSW_IS_PIN);
+
+  response_buffer[0] = RESP_HSSW;
+  response_buffer[1] = hssw_commanded ? 0x01 : 0x00;
+  response_buffer[2] = getSystemFlags();
+  response_buffer[3] = (current_sense >> 8) & 0xFF;
+  response_buffer[4] = current_sense & 0xFF;
+  response_buffer[5] = digitalRead(HSSW_EN_PIN) ? 0x01 : 0x00; // Actual pin level
+  response_buffer[6] = ack; // 0x00 = accepted, 0x01 = rejected (cutoff), 0x02 = unknown sub-command
+  response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
+
+  response_ready = true;
+}
+
+void prepareIMUResponse() {
+  // Angles in milliradians; 0x7FFF in all fields means IMU unavailable
+  int16_t roll_mrad = 0x7FFF;
+  int16_t pitch_mrad = 0x7FFF;
+  int16_t yaw_mrad = 0x7FFF;
+
+  if (imuControl.isConnected()) {
+    float roll, pitch, yaw;
+    imuControl.getOrientation(roll, pitch, yaw);
+    roll_mrad = (int16_t)(roll * 1000.0f);
+    pitch_mrad = (int16_t)(pitch * 1000.0f);
+    yaw_mrad = (int16_t)(yaw * 1000.0f);
+  }
+
+  response_buffer[0] = RESP_IMU;
+  splitInt16(roll_mrad, response_buffer[1], response_buffer[2]);
+  splitInt16(pitch_mrad, response_buffer[3], response_buffer[4]);
+  splitInt16(yaw_mrad, response_buffer[5], response_buffer[6]);
+  response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
+
+  response_ready = true;
+}
+
+void prepareVersionResponse() {
+  response_buffer[0] = RESP_VERSION;
+  response_buffer[1] = FW_VERSION_MAJOR;
+  response_buffer[2] = FW_VERSION_MINOR;
+  response_buffer[3] = 0x00; // Reserved
+  response_buffer[4] = 0x00; // Reserved
+  response_buffer[5] = 0x00; // Reserved
+  response_buffer[6] = 0x00; // Reserved
+  response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
+
   response_ready = true;
 }
 
@@ -360,7 +529,7 @@ void processCommand() {
   if (!boot_latch) {
     boot_latch = true;
     pinMode(HSSW_EN_PIN, OUTPUT);
-    digitalWrite(HSSW_EN_PIN, HIGH);
+    digitalWrite(HSSW_EN_PIN, hssw_commanded ? HIGH : LOW);
   }
   
   // Verify CRC
@@ -469,16 +638,114 @@ void processCommand() {
     response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
     response_ready = true;
     
+  } else if (cmd_id == CMD_BUZZER) {
+    uint8_t sub_cmd = i2c_buffer[1];
+    uint8_t ack = 0x00;
+
+    Serial.print("Buzzer command - Sub: 0x");
+    Serial.println(sub_cmd, HEX);
+
+    switch (sub_cmd) {
+      case BUZZER_QUERY:
+        break;
+      case BUZZER_MANUAL_ON:
+        buzzer_manual_on = true;
+        digitalWrite(BUZZER_PIN, HIGH);
+        break;
+      case BUZZER_MANUAL_OFF:
+        buzzer_manual_on = false;
+        // Only drop the pin if the low battery pattern isn't mid-beep
+        if (buzzer_state != BUZZER_ON && !cutoff_triggered) {
+          digitalWrite(BUZZER_PIN, LOW);
+        }
+        break;
+      case BUZZER_SNOOZE: {
+        uint16_t seconds = ((uint16_t)i2c_buffer[2] << 8) | i2c_buffer[3];
+        if (seconds == 0) seconds = BUZZER_DEFAULT_SNOOZE_S;
+        snooze_start_ms = millis();
+        snooze_duration_ms = (unsigned long)seconds * 1000UL;
+        Serial.print("Low battery buzzer snoozed for ");
+        Serial.print(seconds);
+        Serial.println("s");
+        break;
+      }
+      case BUZZER_UNSNOOZE:
+        snooze_duration_ms = 0;
+        break;
+      case BUZZER_LOWBATT_ENABLE:
+        low_batt_buzzer_enabled = true;
+        break;
+      case BUZZER_LOWBATT_DISABLE:
+        low_batt_buzzer_enabled = false;
+        break;
+      default:
+        ack = 0x01; // Unknown sub-command
+        break;
+    }
+
+    prepareBuzzerResponse(ack);
+
+  } else if (cmd_id == CMD_HSSW) {
+    uint8_t sub_cmd = i2c_buffer[1];
+    uint8_t ack = 0x00;
+
+    Serial.print("HSSW command - Sub: 0x");
+    Serial.println(sub_cmd, HEX);
+
+    switch (sub_cmd) {
+      case HSSW_QUERY:
+        break;
+      case HSSW_ON:
+        if (cutoff_triggered) {
+          ack = 0x01; // Rejected: low voltage cutoff is forcing the HSSW off
+        } else {
+          hssw_commanded = true;
+          if (!(reset_in_progress && (reset_target & RESET_HSSW))) {
+            digitalWrite(HSSW_EN_PIN, HIGH);
+          }
+        }
+        break;
+      case HSSW_OFF:
+        hssw_commanded = false;
+        digitalWrite(HSSW_EN_PIN, LOW);
+        break;
+      default:
+        ack = 0x02; // Unknown sub-command
+        break;
+    }
+
+    prepareHSSWResponse(ack);
+
+  } else if (cmd_id == CMD_IMU) {
+    Serial.println("IMU orientation request received");
+    prepareIMUResponse();
+
+  } else if (cmd_id == CMD_VERSION) {
+    Serial.println("Version request received");
+    prepareVersionResponse();
+
   } else {
     Serial.print("Unknown command ID: 0x");
     Serial.println(cmd_id, HEX);
   }
-  
+
   command_ready = false;
 }
 
 // ---------------------------------------------------------------------
 void setup() {
+  // Assert power rails first: EFUSE_EN keeps the Jetson powered, so it must go
+  // high as early as possible after any MCU reset (before serial delays or the
+  // IMU init retry loop, which can block indefinitely if the IMU is absent)
+  pinMode(EFUSE_EN_PIN, OUTPUT);
+  digitalWrite(EFUSE_EN_PIN, HIGH);
+
+  pinMode(HSSW_EN_PIN, OUTPUT);
+  digitalWrite(HSSW_EN_PIN, HIGH);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
   Serial.begin(115200);
   delay(1000); // Give serial time to initialize
   Serial.println("Enhanced I2C Motor Controller Follower Initializing...");
@@ -497,16 +764,6 @@ void setup() {
   } else {
     Serial.println("IMU initialization failed - using wheel odometry only");
   }
-
-  // Set status LED and buzzer pin
-  pinMode(HSSW_EN_PIN, OUTPUT);
-  digitalWrite(HSSW_EN_PIN, HIGH);
-
-  pinMode(EFUSE_EN_PIN, OUTPUT);
-  digitalWrite(EFUSE_EN_PIN, HIGH);
-  
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
 
   Serial.println("Hardware initialized");
 

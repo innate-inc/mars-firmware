@@ -35,6 +35,13 @@ public:
   float getHeading() const;
 
   /**
+   * Get full orientation in radians
+   * Roll and pitch are raw DMP values; yaw has the calibration offset applied
+   * (identical to getHeading())
+   */
+  void getOrientation(float &roll, float &pitch, float &yaw) const;
+
+  /**
    * Check if new heading data is available
    */
   bool headingAvailable();
@@ -62,6 +69,8 @@ private:
   ICM_20948_I2C _imu;
   
   // State variables
+  float _currentRoll;     // Roll in radians (rotation about X)
+  float _currentPitch;    // Pitch in radians (rotation about Y)
   float _currentHeading;
   float _rawHeading;      // Raw IMU heading (no offset applied)
   float _headingOffset;   // Offset to make current heading = 0 at calibration

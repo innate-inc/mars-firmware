@@ -5,6 +5,7 @@ IMUControl* IMUControl::_instance = nullptr;
 
 IMUControl::IMUControl()
   : _customI2C(&sercom0, A4, A1), // A4 (SDA), A1 (SCL) using SERCOM0
+    _currentRoll(0.0f), _currentPitch(0.0f),
     _currentHeading(0.0f), _headingOffset(0.0f),
     _newHeadingData(false), _initialized(false), _lastUpdateTime(0)
 {
@@ -64,6 +65,12 @@ void IMUControl::update() {
 
 float IMUControl::getHeading() const {
   return _currentHeading;
+}
+
+void IMUControl::getOrientation(float &roll, float &pitch, float &yaw) const {
+  roll = _currentRoll;
+  pitch = _currentPitch;
+  yaw = _currentHeading;
 }
 
 bool IMUControl::headingAvailable() {
@@ -182,6 +189,17 @@ void IMUControl::processQuaternionData() {
     double q2 = (double)_dmpData.Quat9.Data.Q2 / 1073741824.0;
     double q3 = (double)_dmpData.Quat9.Data.Q3 / 1073741824.0;
     double q0 = sqrt(1.0 - (q1*q1 + q2*q2 + q3*q3));
+
+    // Roll (rotation about X)
+    double t3 = 2.0 * (q0*q1 + q2*q3);
+    double t4 = 1.0 - 2.0 * (q1*q1 + q2*q2);
+    _currentRoll = (float)atan2(t3, t4);
+
+    // Pitch (rotation about Y), clamped for asin domain
+    double t2 = 2.0 * (q0*q2 - q3*q1);
+    if (t2 > 1.0) t2 = 1.0;
+    if (t2 < -1.0) t2 = -1.0;
+    _currentPitch = (float)asin(t2);
 
     // Heading (yaw)
     double t0 = 2.0 * (q0*q3 + q1*q2);
