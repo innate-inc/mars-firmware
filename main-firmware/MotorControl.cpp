@@ -12,6 +12,8 @@ MotorControl::MotorControl()
     _lastLeftSpeed(0), _lastRightSpeed(0),
     _lastLeftRPM(0.0f), _lastRightRPM(0.0f),
     _newLeftRPM(false), _newRightRPM(false),
+    _leftTemp(0xFF), _rightTemp(0xFF),
+    _leftTempTime(0), _rightTempTime(0),
     _currentX(0.0f), _currentY(0.0f), _currentTheta(0.0f),
     _lastUpdateTime(0),
     _leftBufIndex(0), _rightBufIndex(0),
@@ -128,6 +130,12 @@ float MotorControl::getLeftRPM() const {
 
 float MotorControl::getRightRPM() const {
   return _lastRightRPM;
+}
+
+void MotorControl::getMotorTemps(uint8_t &left, uint8_t &right) {
+  unsigned long now = millis();
+  left = (_leftTempTime != 0 && now - _leftTempTime < TEMP_STALE_MS) ? _leftTemp : 0xFF;
+  right = (_rightTempTime != 0 && now - _rightTempTime < TEMP_STALE_MS) ? _rightTemp : 0xFF;
 }
 
 void MotorControl::updatePosition(int16_t left_speed, int16_t right_speed) {
@@ -272,6 +280,17 @@ void MotorControl::processMotorFeedback(uint8_t* buffer, size_t& bufIndex, float
         int16_t sp = combineInt16(buffer[2], buffer[3]);
         lastRPM = sp / 10.0f;
         newRPM = true;
+
+        // DDSM210 drive feedback (type 0x64) carries winding temp in byte 7
+        if (buffer[1] == 0x64) {
+          if (buffer == _leftBuffer) {
+            _leftTemp = buffer[7];
+            _leftTempTime = millis();
+          } else {
+            _rightTemp = buffer[7];
+            _rightTempTime = millis();
+          }
+        }
       }
       // Slide buffer
       memmove(buffer, buffer + 1, --bufIndex);

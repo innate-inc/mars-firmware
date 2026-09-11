@@ -38,6 +38,13 @@ public:
   float getLeftRPM() const;
   float getRightRPM() const;
 
+  /**
+   * Get the most recent motor winding temperatures in degrees C
+   * (byte 7 of the DDSM210 drive feedback frame).
+   * Reports 0xFF for a motor with no fresh feedback (stale > 2 s or never seen).
+   */
+  void getMotorTemps(uint8_t &left, uint8_t &right);
+
   /** Update position estimation based on motor speeds */
   void updatePosition(int16_t left_speed, int16_t right_speed);
 
@@ -73,6 +80,13 @@ private:
   float _lastRightRPM;
   bool _newLeftRPM;
   bool _newRightRPM;
+
+  // Motor temperature feedback (DDSM210 drive feedback byte 7, degrees C)
+  uint8_t _leftTemp;
+  uint8_t _rightTemp;
+  unsigned long _leftTempTime;   // millis() of last valid left feedback frame
+  unsigned long _rightTempTime;  // millis() of last valid right feedback frame
+  static const unsigned long TEMP_STALE_MS = 2000;
   
   // Position tracking (matching I2C implementation)
   float _currentX;

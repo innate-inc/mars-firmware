@@ -97,7 +97,8 @@ Response:
 | --- | --- | --- |
 | 0 | `0x83` | |
 | 1–2 | Battery Voltage | `uint16`, volts × 100 (e.g., 1234 = 12.34 V) |
-| 3–4 | Reserved | `0x00` |
+| 3 | Left Motor Temp | **R7.1+**: `uint8`, winding temperature in °C from DDSM210 feedback; `0xFF` = no fresh data (motor silent > 2 s). Sent as `0x00` by older firmware. |
+| 4 | Right Motor Temp | **R7.1+**: as byte 3, right motor. |
 | 5 | Fault Code | Fault code / bitfield |
 | 6 | System Flags | **R7.1+**: bitfield per [A.4](#a4-system-flags-bitfield); always `0x00` on older firmware |
 | 7 | CRC | |

@@ -366,12 +366,17 @@ void prepareStatusResponse() {
   battery_voltage = readBatteryVoltage();
   
   uint16_t battery_scaled = scaleBatteryVoltage(battery_voltage);
-  
+
+  // Motor winding temps in degrees C from DDSM210 feedback; 0xFF = no fresh data.
+  // Revives the R6 spec's motor temperature field (sent as 0x00 in R6..R7.0).
+  uint8_t left_temp, right_temp;
+  motorControl.getMotorTemps(left_temp, right_temp);
+
   response_buffer[0] = RESP_STATUS;
   response_buffer[1] = (battery_scaled >> 8) & 0xFF;
   response_buffer[2] = battery_scaled & 0xFF;
-  response_buffer[3] = 0x00; // Reserved (was motor temp)
-  response_buffer[4] = 0x00; // Reserved (was motor temp)
+  response_buffer[3] = left_temp;
+  response_buffer[4] = right_temp;
   response_buffer[5] = fault_code;
   response_buffer[6] = getSystemFlags(); // Was reserved (0x00); additive system flags bitfield
   response_buffer[7] = calculateCRC8Maxim(response_buffer, 7);
