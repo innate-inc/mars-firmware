@@ -2,12 +2,256 @@
 
 ## 1. Overview
 
-This document describes the **R6 protocol**, which defines communication between the robot's main computer and its microcontroller. The R6 protocol was originally designed for a UART interface; however, the current firmware implementation uses **I2C** as the physical transport (see `main-firmware.ino`). The message framing and payload structure described below still apply. Each transmitted message consists of:
+This document covers two things:
+
+1. **The current I2C protocol (Part A)** — the complete, authoritative reference for how the Jetson Orin Nano talks to the MCU (ItsyBitsy M4 Express) as of firmware **R7.1**. This section is self-contained and is what a client implementation on the Jetson should be written against.
+2. **The legacy R6 UART specification (Part B)** — the original spec the protocol payloads were derived from, kept for historical reference. The current firmware does not use UART, the SOM marker, or the 10-byte physical framing described there.
+
+---
+
+# Part A — I2C Protocol Reference (Current Firmware, R7.1)
+
+## A.1. Transport
+
+- **Bus:** I2C. The MCU is a **follower (slave)** at address **`0x42`**. The Jetson is the bus leader.
+- **Frame:** Every command and every response is exactly **8 bytes**:
+
+  | Byte | Content |
+  | --- | --- |
+  | 0 | Command ID (Jetson → MCU) or Response ID (MCU → Jetson) |
+  | 1–6 | Data fields (layouts per message type below) |
+  | 7 | **CRC-8/MAXIM** computed over bytes 0–6 (polynomial `0x8C` reflected, initial value `0x00`) |
+
+- **Sending a command:** perform an I2C **write of 9 bytes** to address `0x42`: a register byte of **`0x00`** followed by the 8-byte command frame. (With Linux smbus this is `write_i2c_block_data(0x42, 0x00, frame)` where `frame` is the 8-byte list.)
+- **Reading the response:** perform an I2C **read of 8 bytes** from address `0x42`. The MCU holds a single response buffer, filled when it processes a command:
+  - Commands are processed in the MCU main loop, not in the I2C interrupt — allow a few milliseconds between write and read.
+  - If no response is pending (nothing was commanded, the command failed CRC, or the response was already read), the read returns **8 bytes of `0x00`**.
+  - The buffer is one deep: each new command overwrites the previous response. Use a strict write → read cycle per command.
+- **CRC checking:** the MCU silently discards any command whose CRC does not match (the subsequent read returns zeros). The Jetson should likewise verify the CRC on every response and treat all-zeros as "no response".
+- **Multi-byte fields** are **big-endian** (high byte first) unless stated otherwise. Signed fields are two's-complement `int16`.
+
+Reference CRC implementation (Python):
+
+```python
+def crc8_maxim(data: bytes) -> int:
+    crc = 0
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0x8C if crc & 1 else crc >> 1
+    return crc
+
+def make_frame(cmd_id: int, data: bytes = b"") -> list[int]:
+    frame = bytes([cmd_id]) + data.ljust(6, b"\x00")
+    return list(frame + bytes([crc8_maxim(frame)]))
+```
+
+## A.2. Command Set Summary
+
+| Cmd ID | Name | Response ID | Since | Purpose |
+| --- | --- | --- | --- | --- |
+| `0x01` | Move | `0x81` | R6 | Set speed/turn; returns position |
+| `0x03` | Status | `0x83` | R6 | Battery, faults, system flags |
+| `0x04` | Calibrate | `0x84` | R6 | Zero position and heading |
+| `0x05` | Reset | `0x85` | R6 | 1 s power pulse on HSSW and/or e-fuse |
+| `0x06` | Buzzer | `0x86` | **R7.1** | Buzzer control: manual on/off, snooze, enable/disable |
+| `0x07` | HSSW | `0x87` | **R7.1** | High side switch on/off toggle + current sense |
+| `0x08` | IMU | `0x88` | **R7.1** | Full orientation: roll/pitch/yaw |
+| `0x09` | Version | `0x89` | **R7.1** | Firmware version (capability detection) |
+
+**Backwards compatibility:** the R7.1 additions are strictly additive. Frames for `0x01`–`0x05` are byte-identical to older firmware. Firmware older than R7.1 ignores unknown command IDs (the read returns zeros) — so a zero response to `CMD_VERSION` means "pre-R7.1 firmware, base command set only".
+
+## A.3. Commands and Responses
+
+### `0x01` Move → `0x81`
+
+Command:
+
+| Byte | Field | Description |
+| --- | --- | --- |
+| 0 | `0x01` | |
+| 1–2 | Speed | `int16`, forward speed command |
+| 3–4 | Turn | `int16`, turn rate command |
+| 5–6 | Reserved | `0x00` |
+| 7 | CRC | |
+
+The commanded speed/turn is latched and re-applied continuously by the MCU until the next Move command.
+
+Response:
+
+| Byte | Field | Description |
+| --- | --- | --- |
+| 0 | `0x81` | |
+| 1–2 | X | `int16`, position X in **cm** |
+| 3–4 | Y | `int16`, position Y in **cm** |
+| 5–6 | Theta | `int16`, heading in **radians × 100** |
+| 7 | CRC | |
+
+### `0x03` Status → `0x83`
+
+Command: byte 0 = `0x03`, bytes 1–6 = `0x00`, byte 7 = CRC.
+
+Response:
+
+| Byte | Field | Description |
+| --- | --- | --- |
+| 0 | `0x83` | |
+| 1–2 | Battery Voltage | `uint16`, volts × 100 (e.g., 1234 = 12.34 V) |
+| 3–4 | Reserved | `0x00` |
+| 5 | Fault Code | Fault code / bitfield |
+| 6 | System Flags | **R7.1+**: bitfield per [A.4](#a4-system-flags-bitfield); always `0x00` on older firmware |
+| 7 | CRC | |
+
+### `0x04` Calibrate → `0x84`
+
+Command: byte 0 = `0x04`, bytes 1–6 = `0x00`, byte 7 = CRC.
+
+Resets position to (0, 0) and heading to 0. **The MCU blocks for ~1 second** while the IMU settles; do not expect it to respond to other commands during that window.
+
+Response: byte 1 = status (`0` = success, `1` = in progress, `2` = failure), bytes 2–6 = `0x00`.
+
+### `0x05` Reset → `0x85`
+
+Pulses the selected enable line(s) low for 1 second, then restores them high. Note: an e-fuse reset cuts the Jetson's own power (the Jetson sits behind the e-fuse), so the Jetson will not see the completion response for targets `0x02`/`0x03`.
+
+Command: byte 1 = target: `0x01` = HSSW, `0x02` = e-fuse, `0x03` = both. Bytes 2–6 = `0x00`.
+
+Response:
+
+| Byte | Field | Description |
+| --- | --- | --- |
+| 0 | `0x85` | |
+| 1 | Status | `0x00` = not accepted (e.g., low-voltage cutoff active, or invalid target), `0x01` = started, `0x02` = completed (sent after the pulse, HSSW-only resets) |
+| 2 | Target | Target being reset (`0x00` if none) |
+| 3–6 | Reserved | `0x00` |
+| 7 | CRC | |
+
+### `0x06` Buzzer → `0x86` (R7.1)
+
+Command:
+
+| Byte | Field | Description |
+| --- | --- | --- |
+| 0 | `0x06` | |
+| 1 | Sub-command | `0x00` = Query, `0x01` = Manual ON, `0x02` = Manual OFF, `0x03` = Snooze low-battery warning, `0x04` = Cancel snooze, `0x05` = Enable low-battery warning, `0x06` = Disable low-battery warning |
+| 2–3 | Snooze Duration | `uint16` seconds; only used with sub-command `0x03` (`0` = default 60 s) |
+| 4–6 | Reserved | `0x00` |
+| 7 | CRC | |
+
+Response:
+
+| Byte | Field | Description |
+| --- | --- | --- |
+| 0 | `0x86` | |
+| 1 | System Flags | Bitfield per [A.4](#a4-system-flags-bitfield) |
+| 2–3 | Snooze Remaining | `uint16` seconds left on the current snooze (`0` if not snoozed) |
+| 4 | Ack | `0x00` = accepted, `0x01` = unknown sub-command |
+| 5–6 | Reserved | `0x00` |
+| 7 | CRC | |
+
+Behavior:
+
+- The low-battery warning pattern (3 × 1 s beeps, 10 s pause, repeat; triggers below 10.5 V) behaves like an interrupt: it overlays the manual buzzer state while active, and the buzzer returns to the manual state when it ends or is snoozed/disabled.
+- Snooze suppresses only the warning pattern, auto-expires, and is cleared when the battery recovers above 11.0 V (hysteresis), so the next low-battery event beeps again.
+- The constant beep in the low-voltage **cutoff** state (below 10.3 V) is not snoozable — the e-fuse has already dropped Jetson power at that point.
+
+### `0x07` HSSW → `0x87` (R7.1)
+
+Command: byte 1 = sub-command: `0x00` = Query, `0x01` = ON, `0x02` = OFF. Bytes 2–6 = `0x00`.
+
+Response:
+
+| Byte | Field | Description |
+| --- | --- | --- |
+| 0 | `0x87` | |
+| 1 | Commanded State | `0x01` = ON commanded, `0x00` = OFF commanded |
+| 2 | System Flags | Bitfield per [A.4](#a4-system-flags-bitfield) |
+| 3–4 | Current Sense | `uint16`, raw 12-bit ADC reading of the HSSW current-sense pin (A0) |
+| 5 | Actual Pin Level | `0x01` = enable pin high, `0x00` = low (differs from commanded during a reset pulse or cutoff) |
+| 6 | Ack | `0x00` = accepted, `0x01` = ON rejected (low-voltage cutoff active), `0x02` = unknown sub-command |
+| 7 | CRC | |
+
+Behavior:
+
+- ON is rejected while the low-voltage cutoff is latched.
+- A Reset command (`0x05`) targeting the HSSW still pulses it; the pulse always ends with the HSSW commanded ON.
+- The commanded state survives cutoff/recovery: on voltage recovery the HSSW is restored to the last commanded state.
+
+### `0x08` IMU → `0x88` (R7.1)
+
+Command: byte 0 = `0x08`, bytes 1–6 = `0x00`, byte 7 = CRC.
+
+Response:
+
+| Byte | Field | Description |
+| --- | --- | --- |
+| 0 | `0x88` | |
+| 1–2 | Roll | `int16`, **milliradians** (rotation about X) |
+| 3–4 | Pitch | `int16`, **milliradians** (rotation about Y) |
+| 5–6 | Yaw | `int16`, **milliradians** (heading; calibration offset applied — the same angle as Theta in `0x81`, at 10× finer resolution) |
+| 7 | CRC | |
+
+All three fields read `0x7FFF` (32767) when the IMU is unavailable.
+
+### `0x09` Version → `0x89` (R7.1)
+
+Command: byte 0 = `0x09`, bytes 1–6 = `0x00`, byte 7 = CRC.
+
+Response: byte 1 = major version, byte 2 = minor version (R7.1 firmware reports `7`, `1`), bytes 3–6 = `0x00`. An all-zero read after this command indicates pre-R7.1 firmware.
+
+## A.4. System Flags Bitfield
+
+Reported in Status byte 6, Buzzer response byte 1, and HSSW response byte 2:
+
+| Bit | Mask | Meaning |
+| --- | --- | --- |
+| 0 | `0x01` | Buzzer pin currently driven high |
+| 1 | `0x02` | Low-voltage warning latched (dipped below 10.5 V, not yet recovered above 11.0 V) |
+| 2 | `0x04` | Low-voltage cutoff latched (dipped below 10.3 V — HSSW and e-fuse forced off) |
+| 3 | `0x08` | Low-battery buzzer snoozed |
+| 4 | `0x10` | Low-battery buzzer enabled (default 1) |
+| 5 | `0x20` | HSSW commanded on |
+| 6 | `0x40` | Buzzer manually commanded on |
+| 7 | `0x80` | Reset pulse in progress |
+
+## A.5. Jetson Client Example (Python, smbus2)
+
+```python
+import time
+from smbus2 import SMBus, i2c_msg
+
+MCU_ADDR = 0x42
+
+def transact(bus: SMBus, cmd_id: int, data: bytes = b"") -> bytes:
+    bus.write_i2c_block_data(MCU_ADDR, 0x00, make_frame(cmd_id, data))
+    time.sleep(0.005)  # let the MCU main loop process the command
+    read = i2c_msg.read(MCU_ADDR, 8)
+    bus.i2c_rdwr(read)
+    resp = bytes(read)
+    if resp == bytes(8):
+        return b""  # no response pending (or pre-R7.1 firmware for new commands)
+    if crc8_maxim(resp[:7]) != resp[7]:
+        raise IOError(f"response CRC mismatch: {resp.hex()}")
+    return resp
+
+with SMBus(7) as bus:  # use the I2C bus number wired to the MCU
+    fw = transact(bus, 0x09)                          # version query
+    print("firmware", f"{fw[1]}.{fw[2]}" if fw else "pre-R7.1")
+    print("status  ", transact(bus, 0x03).hex())      # battery/faults/flags
+    print("imu     ", transact(bus, 0x08).hex())      # roll/pitch/yaw (mrad)
+    transact(bus, 0x06, bytes([0x03, 0x00, 0x78]))    # snooze buzzer 120 s
+```
+
+---
+
+# Part B — Legacy R6 UART Specification (Historical)
+
+This part describes the original **R6 protocol**, designed for a UART interface. The current firmware uses I2C (Part A); the payload structures here are the ancestors of the I2C frames. In the R6 spec, each transmitted message consists of:
 
 - **2 bytes for the Start-of-Message (SOM) marker:** Fixed value 0x69 0x69, which delineates the start of a new message.
 - **8 bytes of protocol message:** This includes 7 bytes of payload (ID and data fields) and 1 byte of CRC (calculated using CRC‑8/MAXIM over the payload bytes).
 
-The overall physical message length is therefore **10 bytes**.
+The overall physical message length is therefore **10 bytes**. **Byte offsets in Part B are offsets into this 10-byte UART message** (payload starts at byte 2); over I2C the same payloads start at byte 0 — see Part A.
 
 ---
 
@@ -150,55 +394,6 @@ Commands are sent from the main computer to the microcontroller. The first byte 
 | 3–8 | Reserved | 6 | All `0x00` |
 | 9 | **CRC** | 1 | CRC-8/MAXIM over bytes 2–8 |
 
-### 4.5. Buzzer Command (R7.1 addition)
-
-- **Command ID:** `0x06`
-- **Purpose:** Control the buzzer: query state, manual on/off, snooze the low battery warning, or enable/disable the low battery warning entirely.
-- **Payload Layout (Bytes 2–8):**
-
-    | Byte Offset | Field | Size | Description |
-    | --- | --- | --- | --- |
-    | 2 | Cmd ID | 1 byte | `0x06` (Buzzer command) |
-    | 3 | Sub-command | 1 byte | `0x00` = Query, `0x01` = Manual ON, `0x02` = Manual OFF, `0x03` = Snooze low battery warning, `0x04` = Cancel snooze, `0x05` = Enable low battery warning, `0x06` = Disable low battery warning |
-    | 4–5 | Snooze Duration | 2 bytes | Only used with sub-command `0x03`: 16-bit unsigned snooze duration in seconds (`0` = default 60 s). Byte 4 is high byte. |
-    | 6–8 | Reserved | 3 bytes | Set to `0x00`. |
-    | 9 | **CRC** | 1 byte | CRC‑8/MAXIM computed over bytes 2–8. |
-
-    **Behavior notes:**
-    - The low battery warning pattern (3 beeps + 10 s pause) acts like an interrupt: while active it overrides the manual buzzer state; when it ends (or is snoozed/disabled) the buzzer returns to the manual state.
-    - Snooze suppresses only the low battery *warning* pattern; it auto-expires after the requested duration and is cleared when the battery voltage recovers above the hysteresis threshold.
-    - The constant beep in the low voltage *cutoff* state is not snoozable (the e-fuse has already cut Jetson power at that point).
-
-### 4.6. High Side Switch Command (R7.1 addition)
-
-- **Command ID:** `0x07`
-- **Purpose:** Query or set the high side switch (HSSW) output directly, in addition to the fixed-duration pulse of the Reset command (`0x05`).
-- **Payload Layout (Bytes 2–8):**
-
-    | Byte Offset | Field | Size | Description |
-    | --- | --- | --- | --- |
-    | 2 | Cmd ID | 1 byte | `0x07` (HSSW command) |
-    | 3 | Sub-command | 1 byte | `0x00` = Query, `0x01` = ON, `0x02` = OFF |
-    | 4–8 | Reserved | 5 bytes | Set to `0x00`. |
-    | 9 | **CRC** | 1 byte | CRC‑8/MAXIM computed over bytes 2–8. |
-
-    **Behavior notes:**
-    - `ON` is rejected while the low voltage cutoff is latched (the firmware is forcing the HSSW off to protect the battery).
-    - A Reset command (`0x05`) targeting the HSSW still pulses it off for 1 s; the pulse always ends with the HSSW on (commanded state is set back to ON).
-    - The commanded state survives a low-battery cutoff/recovery cycle: on voltage recovery the HSSW is restored to the last commanded state, not blindly turned on.
-
-### 4.7. IMU Orientation Request (R7.1 addition)
-
-- **Command ID:** `0x08`
-- **Purpose:** Request the full IMU orientation (roll, pitch, yaw) rather than only the heading embedded in the Movement response.
-- **Payload Layout:** Bytes 3–8 reserved (`0x00`), CRC over bytes 2–8.
-
-### 4.8. Firmware Version Request (R7.1 addition)
-
-- **Command ID:** `0x09`
-- **Purpose:** Query the firmware version so the main computer can detect which protocol features are available. Firmware older than 7.1 does not answer this command (the response read will return all zeros), which itself signals that only the base R6 command set is supported.
-- **Payload Layout:** Bytes 3–8 reserved (`0x00`), CRC over bytes 2–8.
-
 ---
 
 ## 5. Response Message Types
@@ -250,7 +445,7 @@ Responses are sent from the microcontroller back to the main computer. The conve
     | 3–4 | Battery Voltage | 2 bytes | 16‑bit unsigned value representing battery voltage scaled by 100 (e.g., 12.34V → 1234). |
     | 5–6 | Motor Temperature | 2 bytes | 16‑bit value for motor temperature (units and scaling defined by the system). |
     | 7 | Fault Code | 1 byte | Fault code or bitfield indicating errors or warnings. |
-    | 8 | System Flags | 1 byte | **R7.1 addition** (previously reserved, always `0x00`): system flags bitfield — see [Section 5.9](#59-system-flags-bitfield). Firmware older than 7.1 always sends `0x00` here, so parsers that ignored this byte remain compatible. |
+    | 8 | System Flags | 1 byte | **R7.1 addition** (previously reserved, always `0x00`): system flags bitfield — see [Section A.4](#a4-system-flags-bitfield) in Part A. Firmware older than 7.1 always sends `0x00` here, so parsers that ignored this byte remain compatible. |
     | 9 | **CRC** | 1 byte | CRC‑8/MAXIM computed over bytes 2–8. |
 
 ### 5.4. Calibration Response
@@ -267,73 +462,6 @@ Responses are sent from the microcontroller back to the main computer. The conve
 | 3 | Status | 1 | 0 = Success, 1 = In Progress, 2 = Failure |
 | 4–8 | Reserved | 5 | All `0x00` |
 | 9 | **CRC** | 1 | CRC-8/MAXIM over bytes 2–8 |
-
-### 5.5. Buzzer Response (R7.1 addition)
-
-- **Response ID:** `0x86` (i.e., 0x06 + 0x80)
-- **Purpose:** Report buzzer and low battery warning state. Sent in reply to any Buzzer command, including queries.
-- **Payload Layout (Bytes 2–8):**
-
-    | Byte Offset | Field | Size | Description |
-    | --- | --- | --- | --- |
-    | 2 | Response ID | 1 byte | `0x86` |
-    | 3 | System Flags | 1 byte | Bitfield — see [Section 5.9](#59-system-flags-bitfield). |
-    | 4–5 | Snooze Remaining | 2 bytes | 16-bit unsigned seconds remaining on the current snooze (`0` if not snoozed). Byte 4 is high byte. |
-    | 6 | Ack | 1 byte | `0x00` = sub-command accepted, `0x01` = unknown sub-command. |
-    | 7–8 | Reserved | 2 bytes | `0x00`. |
-    | 9 | **CRC** | 1 byte | CRC‑8/MAXIM computed over bytes 2–8. |
-
-### 5.6. High Side Switch Response (R7.1 addition)
-
-- **Response ID:** `0x87` (i.e., 0x07 + 0x80)
-- **Purpose:** Report HSSW state and current-sense telemetry. Sent in reply to any HSSW command, including queries.
-- **Payload Layout (Bytes 2–8):**
-
-    | Byte Offset | Field | Size | Description |
-    | --- | --- | --- | --- |
-    | 2 | Response ID | 1 byte | `0x87` |
-    | 3 | Commanded State | 1 byte | `0x01` = ON commanded, `0x00` = OFF commanded. |
-    | 4 | System Flags | 1 byte | Bitfield — see [Section 5.9](#59-system-flags-bitfield). |
-    | 5–6 | Current Sense | 2 bytes | Raw 12-bit ADC reading of the HSSW current-sense pin (A0), 16-bit unsigned, byte 5 is high byte. |
-    | 7 | Actual Pin Level | 1 byte | `0x01` = HSSW enable pin currently high, `0x00` = low (can differ from commanded state during a reset pulse or cutoff). |
-    | 8 | Ack | 1 byte | `0x00` = accepted, `0x01` = ON rejected due to low voltage cutoff, `0x02` = unknown sub-command. |
-    | 9 | **CRC** | 1 byte | CRC‑8/MAXIM computed over bytes 2–8. |
-
-### 5.7. IMU Orientation Response (R7.1 addition)
-
-- **Response ID:** `0x88` (i.e., 0x08 + 0x80)
-- **Purpose:** Report the full IMU orientation.
-- **Payload Layout (Bytes 2–8):**
-
-    | Byte Offset | Field | Size | Description |
-    | --- | --- | --- | --- |
-    | 2 | Response ID | 1 byte | `0x88` |
-    | 3–4 | Roll | 2 bytes | 16-bit signed roll (rotation about X) in **milliradians**. |
-    | 5–6 | Pitch | 2 bytes | 16-bit signed pitch (rotation about Y) in **milliradians**. |
-    | 7–8 | Yaw | 2 bytes | 16-bit signed yaw (heading, calibration offset applied — same angle as Theta in the Movement response) in **milliradians**. |
-    | 9 | **CRC** | 1 byte | CRC‑8/MAXIM computed over bytes 2–8. |
-
-    **Note:** All three fields are set to `0x7FFF` (32767) when the IMU is not connected. Milliradian scaling (×1000) gives ~0.057° resolution, finer than the ×100 radian scaling used for Theta in the Movement response; the legacy Theta field is unchanged.
-
-### 5.8. Firmware Version Response (R7.1 addition)
-
-- **Response ID:** `0x89` (i.e., 0x09 + 0x80)
-- **Payload Layout:** Byte 3 = major version, byte 4 = minor version (e.g., `7`, `1` for firmware R7.1), bytes 5–8 reserved (`0x00`), CRC over bytes 2–8.
-
-### 5.9. System Flags Bitfield
-
-Shared bitfield reported in the Status response (byte 8), Buzzer response (byte 3), and HSSW response (byte 4):
-
-| Bit | Mask | Meaning |
-| --- | --- | --- |
-| 0 | `0x01` | Buzzer pin currently driven high |
-| 1 | `0x02` | Low voltage warning latched (battery dipped below 10.5 V, not yet recovered above 11.0 V) |
-| 2 | `0x04` | Low voltage cutoff latched (battery dipped below 10.3 V — HSSW and e-fuse forced off) |
-| 3 | `0x08` | Low battery buzzer currently snoozed |
-| 4 | `0x10` | Low battery buzzer enabled (default 1) |
-| 5 | `0x20` | HSSW commanded on |
-| 6 | `0x40` | Buzzer manually commanded on |
-| 7 | `0x80` | Reset pulse in progress |
 
 ---
 
