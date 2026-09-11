@@ -1,0 +1,2 @@
+main-firmware/build/**
+!main-firmware/build/adafruit.samd.adafruit_itsybitsy_m4/main-firmware.ino.bin
