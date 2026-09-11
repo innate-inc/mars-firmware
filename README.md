@@ -504,6 +504,11 @@ V_battery = (raw / 4095) × 3.3 × (R_TOP + R_BOTTOM) / R_BOTTOM
 
 ## 8. Firmware Update over I2C — Feasibility (R7.1 analysis)
 
+> **Update: implemented as of R7.1.** The application-level A/B bank-swap
+> scheme described below is now in the firmware (`FirmwareUpdate.cpp`,
+> commands `0x0A`–`0x0F`). The full protocol, a reference Python updater,
+> and the test plan live in [I2C_FIRMWARE_UPDATE.md](I2C_FIRMWARE_UPDATE.md).
+
 **Question:** Can the Jetson reflash the MCU over the existing I2C bus, given that the Jetson's own power depends on the MCU holding the e-fuse enable line high?
 
 **Short answer:** Not with the stock setup, but yes with an application-level A/B update scheme — with one hardware caveat around the reset moment.

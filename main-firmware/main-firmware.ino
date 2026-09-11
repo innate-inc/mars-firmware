@@ -10,6 +10,7 @@
 #include "MotorControl.h"
 #include "IMUControl.h"
 #include "Utils.h"
+#include "FirmwareUpdate.h"
 
 // ---------------------------------------------------------------------
 // I2C Configuration
@@ -24,6 +25,12 @@
 #define CMD_HSSW 0x07       // High side switch control (query/on/off)
 #define CMD_IMU 0x08        // Full IMU orientation request (roll/pitch/yaw)
 #define CMD_VERSION 0x09    // Firmware version request
+#define CMD_FWUP_BEGIN 0x0A  // Start firmware update session (erase + stage bootloader)
+#define CMD_FWUP_DATA 0x0B   // Firmware image data chunk (variable-length frame)
+#define CMD_FWUP_STATUS 0x0C // Query update session state
+#define CMD_FWUP_COMMIT 0x0D // Verify staged image CRC32
+#define CMD_FWUP_APPLY 0x0E  // Bank swap + reset (or rollback)
+#define CMD_FWUP_ABORT 0x0F  // Abandon update session
 
 // Response definitions (MCU → Jetson)
 #define RESP_MOVE 0x81      // Position feedback
@@ -34,6 +41,7 @@
 #define RESP_HSSW 0x87      // High side switch state
 #define RESP_IMU 0x88       // Full IMU orientation (roll/pitch/yaw)
 #define RESP_VERSION 0x89   // Firmware version
+// 0x8A-0x8F: firmware update responses (defined in FirmwareUpdate.cpp)
 
 // Firmware version (reported via CMD_VERSION so the Jetson can detect capabilities)
 #define FW_VERSION_MAJOR 7
@@ -128,6 +136,11 @@ int16_t latestTurnCmd = 0;
 uint8_t reset_target = RESET_NONE;
 unsigned long reset_start_time = 0;
 bool reset_in_progress = false;
+
+// Firmware update chunk staging (filled in the I2C ISR, consumed in loop)
+volatile bool dfu_chunk_ready = false;
+uint8_t dfu_chunk_buffer[DFU_MAX_FRAME];
+volatile uint16_t dfu_chunk_len = 0;
 
 // ---------------------------------------------------------------------
 // Buzzer helpers
@@ -468,29 +481,61 @@ void prepareVersionResponse() {
 
 // Function that executes when data is received from leader
 void receiveEvent(int numBytes) {
-  if (numBytes == 9) {  // 8-byte command + 1 register byte
-    // Read register byte (should be 0x00)
+  if (numBytes >= 7) {
+    // Read register byte (should be 0x00) and peek the frame ID
     uint8_t register_byte = Wire.read();
-    
-    // Read the 8-byte command
-    for (int i = 0; i < 8 && Wire.available(); i++) {
-      i2c_buffer[i] = Wire.read();
+    (void)register_byte;
+    uint8_t frame_id = Wire.read();
+
+    if (frame_id == CMD_FWUP_DATA) {
+      // Variable-length firmware data chunk: [0x0B][seq_hi][seq_lo][len][data...][CRC8]
+      if (!dfu_chunk_ready) {
+        dfu_chunk_buffer[0] = frame_id;
+        uint16_t i = 1;
+        while (Wire.available() && i < sizeof(dfu_chunk_buffer)) {
+          dfu_chunk_buffer[i++] = Wire.read();
+        }
+        while (Wire.available()) {
+          Wire.read();
+        }
+        dfu_chunk_len = i;
+        dfu_chunk_ready = true;
+      } else {
+        // Previous chunk not yet processed - drop; leader recovers via seq ack
+        while (Wire.available()) {
+          Wire.read();
+        }
+      }
+      return;
     }
-    
-    // Clear any remaining bytes
-    while (Wire.available()) {
-      Wire.read();
+
+    if (numBytes == 9) {  // 8-byte command + 1 register byte
+      i2c_buffer[0] = frame_id;
+      for (int i = 1; i < 8 && Wire.available(); i++) {
+        i2c_buffer[i] = Wire.read();
+      }
+
+      // Clear any remaining bytes
+      while (Wire.available()) {
+        Wire.read();
+      }
+
+      command_ready = true;
+
+      Serial.print("Command received: ");
+      for (int i = 0; i < 8; i++) {
+        Serial.print("0x");
+        Serial.print(i2c_buffer[i], HEX);
+        Serial.print(" ");
+      }
+      Serial.println();
+    } else {
+      // Unknown frame shape - discard
+      while (Wire.available()) {
+        Wire.read();
+      }
+      Serial.println("Invalid command length");
     }
-    
-    command_ready = true;
-    
-    Serial.print("Command received: ");
-    for (int i = 0; i < 8; i++) {
-      Serial.print("0x");
-      Serial.print(i2c_buffer[i], HEX);
-      Serial.print(" ");
-    }
-    Serial.println();
   } else if (numBytes == 1) {
     // This is a read request - just consume the byte
     uint8_t read_register = Wire.read();
@@ -729,6 +774,26 @@ void processCommand() {
     Serial.println("Version request received");
     prepareVersionResponse();
 
+  } else if (cmd_id == CMD_FWUP_BEGIN) {
+    dfuHandleBegin(i2c_buffer, response_buffer);
+    response_ready = true;
+
+  } else if (cmd_id == CMD_FWUP_STATUS) {
+    dfuHandleStatus(response_buffer);
+    response_ready = true;
+
+  } else if (cmd_id == CMD_FWUP_COMMIT) {
+    dfuHandleCommit(i2c_buffer, response_buffer);
+    response_ready = true;
+
+  } else if (cmd_id == CMD_FWUP_APPLY) {
+    dfuHandleApply(i2c_buffer, response_buffer);
+    response_ready = true;
+
+  } else if (cmd_id == CMD_FWUP_ABORT) {
+    dfuHandleAbort(response_buffer);
+    response_ready = true;
+
   } else {
     Serial.print("Unknown command ID: 0x");
     Serial.println(cmd_id, HEX);
@@ -798,7 +863,16 @@ void loop() {
   
   // Process any received I2C commands
   processCommand();
-  
+
+  // Process firmware update data chunks and pending bank swaps
+  if (dfu_chunk_ready) {
+    dfuHandleDataChunk(dfu_chunk_buffer, dfu_chunk_len, response_buffer);
+    response_ready = true;
+    dfu_chunk_ready = false;
+  }
+  dfuUpdate();
+
+
   motorControl.executeCommand(latestSpeedCmd, latestTurnCmd);
   // Process motor feedback to get actual RPM data
   motorControl.processFeedback();
